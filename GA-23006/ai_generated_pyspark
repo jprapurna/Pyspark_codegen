@@ -1,0 +1,391 @@
+import logging
+from pyspark.sql import functions as F
+import psycopg2
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    # Step 1: Load source data from Unity Catalog table
+    logger.info("Loading source data from Unity Catalog table: catalog.source_db.source_table")
+    source_df = spark.table("catalog.source_db.source_table")
+
+    # Step 2: Apply transformations as per lineage plan
+    logger.info("Applying transformations to source data")
+    
+    # Example transformation: Add a derived column based on existing columns
+    transformed_df = source_df.withColumn("DERIVED_RDRVR_AGE", F.when(F.col("RDRVR_DT_OF_BRTH").isNotNull(), 
+                                                                      F.year(F.current_date()) - F.year(F.to_date(F.col("RDRVR_DT_OF_BRTH"), "yyyy-MM-dd")))
+                                                  .otherwise(None))
+    
+    # Example transformation: Filter rows based on a condition
+    transformed_df = transformed_df.filter(F.col("REC_DROP_IND") != "Y")
+    
+    # Example transformation: Rename columns for clarity
+    transformed_df = transformed_df.withColumnRenamed("NISS_CLASS_CD", "CLASS_CODE") \
+                                   .withColumnRenamed("NISS_CVG_CD", "COVERAGE_CODE")
+    
+    # Example transformation: Add a timestamp column for tracking
+    transformed_df = transformed_df.withColumn("DW_UPD_TMSP", F.lit(datetime.now()))
+    
+    # Step 3: Write transformed data to Unity Catalog target table
+    logger.info("Writing transformed data to Unity Catalog target table: catalog.target_db.target_table")
+    spark.sql("DROP TABLE IF EXISTS catalog.target_db.target_table")  # Drop existing table if it exists
+    transformed_df.write.format("delta").mode("overwrite").saveAsTable("catalog.target_db.target_table")
+
+    logger.info("ETL process completed successfully")
+
+except Exception as e:
+    logger.error(f"An error occurred during the ETL process: {e}")
+    raise
+
+
+import logging
+from pyspark.sql import functions as F
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    # Step 1: Load source data from Unity Catalog table
+    logger.info("Loading source data from Unity Catalog table...")
+    source_table = "catalog.source_db.FDR_WRK_BIRP_NISS_APRM_DETL"
+    source_df = spark.sql(f"""
+        SELECT
+            NISS_APRM_DETL_SK,
+            LTRIM(RTRIM(ST_ABBR)) AS ST_ABBR,
+            LTRIM(RTRIM(ST_CD)) AS ST_CD,
+            LTRIM(RTRIM(RATNG_CMPY_CD)) AS RATNG_CMPY_CD,
+            LTRIM(RTRIM(MLT_CAR_IND)) AS MLT_CAR_IND,
+            LTRIM(RTRIM(RT_CLS)) AS RT_CLS,
+            LTRIM(RTRIM(FINAL_RDRVR_AGE)) AS FINAL_RDRVR_AGE,
+            LTRIM(RTRIM(GENDR)) AS GENDR,
+            LTRIM(RTRIM(MRTL_STAT)) AS MRTL_STAT,
+            LTRIM(RTRIM(AUTO_USE_CD)) AS AUTO_USE_CD,
+            LTRIM(RTRIM(MILES_TO_WRK)) AS MILES_TO_WRK,
+            LTRIM(RTRIM(GOOD_STDNT_IND)) AS GOOD_STDNT_IND,
+            LTRIM(RTRIM(DRVR_TRNG_IND)) AS DRVR_TRNG_IND,
+            LTRIM(RTRIM(SOI_TYP)) AS SOI_TYP,
+            LTRIM(RTRIM(ACCTNG_LOB)) AS ACCTNG_LOB,
+            LTRIM(RTRIM(CVG_TYP_CD)) AS CVG_TYP_CD,
+            REC_EXCPN_IND,
+            REC_EXCPN_RSN_DESC
+        FROM {source_table}
+        WHERE ST_ABBR NOT IN ('NY', 'NJ') AND SOURCE_IND_DERIVED = 'FARMERS'
+    """)
+    logger.info("Source data loaded successfully.")
+
+    # Step 2: Apply transformation logic to derive NISS classification code
+    logger.info("Applying transformation logic to derive NISS classification code...")
+    transformed_df = source_df.withColumn(
+        "NISS_CLASS_CD_FL",
+        F.when(
+            (F.col("ST_ABBR") == "FL") & (F.col("FINAL_RDRVR_AGE") != " "),
+            F.when(
+                (F.col("FINAL_RDRVR_AGE").cast("int") < 25) &
+                (F.col("RATNG_CMPY_CD") == "K") &
+                (F.col("MLT_CAR_IND") == "N") &
+                ((F.col("RT_CLS").substr(-1, 1) == "5") | (F.col("RT_CLS").isin("5M", "9", "5F", "2F", "2M"))) &
+                (F.col("MRTL_STAT") == "M") &
+                (F.col("AUTO_USE_CD") != "FRM"),
+                F.lit("1620")
+            ).when(
+                (F.col("FINAL_RDRVR_AGE").cast("int") < 25) &
+                (F.col("RATNG_CMPY_CD") == "K") &
+                (F.col("MLT_CAR_IND") == "N") &
+                ((F.col("RT_CLS").substr(-1, 1) == "5") | (F.col("RT_CLS").isin("5M", "9", "5F", "2F", "2M"))) &
+                (F.col("MRTL_STAT") == "M") &
+                (F.col("AUTO_USE_CD") == "FRM"),
+                F.lit("1623")
+            ).otherwise("")
+        ).otherwise("")
+    )
+    logger.info("Transformation logic applied successfully.")
+
+    # Step 3: Write transformed data to Unity Catalog target table
+    logger.info("Writing transformed data to Unity Catalog target table...")
+    target_table = "catalog.target_db.NISS_CLASSIFICATION"
+    spark.sql(f"DROP TABLE IF EXISTS {target_table}")
+    transformed_df.write.format("delta").mode("overwrite").saveAsTable(target_table)
+    logger.info("Transformed data written successfully to Unity Catalog target table.")
+
+except Exception as e:
+    logger.error(f"An error occurred during the ETL process: {str(e)}")
+    raise
+
+
+import logging
+from pyspark.sql.functions import col
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    # Log the start of the ETL process
+    logger.info("Starting ETL process for UPD_NISS_CLASS_CD.")
+
+    # Step 1: Load source data from Unity Catalog table
+    logger.info("Loading source data from Unity Catalog table.")
+    source_table = "catalog.source_db.niss_auto_aprm_dtl"
+    source_df = spark.table(source_table)
+
+    # Step 2: Apply transformations based on the lineage plan
+    logger.info("Applying transformations to update NISS_CLASS_CD.")
+    
+    # Transformation logic:
+    # - Passthrough fields: NISS_APRM_DETL_SK, NISS_CLASS_CD, REC_EXCP_IND, REC_EXCP_DESC
+    # - Update Strategy Expression: DD_UPDATE (assumed to be a flag for updates)
+    transformed_df = source_df.select(
+        col("NISS_APRM_DETL_SK"),
+        col("NISS_CLASS_CD"),
+        col("REC_EXCP_IND"),
+        col("REC_EXCP_DESC")
+    ).withColumn("Action", col("DD_UPDATE"))  # Adding the update strategy column
+
+    # Step 3: Write the transformed data to the target Unity Catalog table
+    logger.info("Writing transformed data to Unity Catalog target table.")
+    target_table = "catalog.target_db.niss_auto_aprm_dtl_upd_classcd"
+    
+    # Drop the target table if it exists
+    logger.info(f"Dropping target table {target_table} if it exists.")
+    spark.sql(f"DROP TABLE IF EXISTS {target_table}")
+    
+    # Write the transformed data
+    transformed_df.write.format("delta").mode("overwrite").saveAsTable(target_table)
+
+    # Log the successful completion of the ETL process
+    logger.info("ETL process completed successfully for UPD_NISS_CLASS_CD.")
+
+except Exception as e:
+    # Log any errors that occur during the ETL process
+    logger.error(f"An error occurred during the ETL process: {str(e)}")
+    raise
+
+
+import logging
+from pyspark.sql.functions import col, expr
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    # Load source data from Unity Catalog
+    logger.info("Loading source data from Unity Catalog...")
+    source_df = spark.table("catalog.source_db.source_table")
+
+    # Apply transformations based on the mapping data
+    logger.info("Applying transformations...")
+    transformed_df = source_df.select(
+        col("NISS_APRM_DETL_SK").alias("NISS_APRM_DETL_SK"),  # Passthrough
+        col("i_REC_EXCPN_IND").alias("i_REC_EXCPN_IND"),      # Passthrough
+        col("REC_EXCPTN_RSN_DESC_ZIP").alias("REC_EXCPTN_RSN_DESC_ZIP"),  # Passthrough
+        expr("CASE WHEN I_AUTO_USE_CD IS NULL THEN '' ELSE I_AUTO_USE_CD END").alias("AUTO_USE_CD"),  # Transform
+        expr("CAST(AGE AS INT)").alias("IAGE"),               # Transform
+        expr("CAST(MILES_TO_WRK AS INT)").alias("IMILES_TO_WRK"),  # Transform
+        expr("""
+            CASE 
+                WHEN NOT (ST_ABBR IN ('NY', 'NJ', 'NC', 'AR', 'SD', 'PA')) AND ACCTNG_LOB = '1923D' THEN '941400'
+                WHEN ST_ABBR IN ('AR') AND ACCTNG_LOB = '191' THEN '946400'
+                WHEN ST_ABBR IN ('SD') AND ACCTNG_LOB = '1923D' THEN '946400'
+                WHEN ST_ABBR IN ('PA') AND ACCTNG_LOB = '191' AND CVG_TYP_CD IN ('35043', '35046') THEN '999700'
+                ELSE '??????'
+            END
+        """).alias("v_CLASS_CD_Indemnity"),  # Transform
+        expr("""
+            CASE 
+                WHEN NOT (ST_ABBR IN ('NY', 'NJ', 'NC', 'MI', 'MT', 'PA')) AND 
+                     RATNG_CMPY_CD IN ('N', 'B', 'K', 'J', 'L') AND 
+                     ST_CD IN ('04', '07', '08', '10', '11', '12', '13', '14', '15', '16', '18', '21', '22', '25', '34', '36', '50', '66', '67', '68', '73', '75', '76', '79', '88', '44', '91') THEN
+                    CASE 
+                        WHEN IAGE >= 65 THEN '1700'
+                        WHEN IAGE >= 25 AND IAGE < 65 AND NOT (AUTO_USE_CD IN ('SLS')) THEN
+                            CASE 
+                                WHEN MLT_CAR_IND = 'N' THEN '1200'
+                                ELSE '1202'
+                            END
+                        WHEN IAGE < 25 THEN
+                            CASE 
+                                WHEN GENDR = 'M' THEN
+                                    CASE 
+                                        WHEN MLT_CAR_IND = 'N' THEN '1600'
+                                        ELSE '1602'
+                                    END
+                                WHEN GENDR = 'F' THEN
+                                    CASE 
+                                        WHEN MLT_CAR_IND = 'N' THEN '1640'
+                                        ELSE '1642'
+                                    END
+                                WHEN LTRIM(RTRIM(GENDR)) IN ('U', '', 'X') OR GENDR IS NULL THEN
+                                    CASE 
+                                        WHEN MLT_CAR_IND = 'N' THEN 'E600'
+                                        ELSE 'E602'
+                                    END
+                                ELSE ''
+                            END
+                        WHEN TO_CHAR(IAGE) = '' OR IAGE IS NULL OR LTRIM(RTRIM(GENDR)) = '' OR GENDR IS NULL AND NOT (AUTO_USE_CD IN ('SLS')) THEN
+                            CASE 
+                                WHEN MLT_CAR_IND = 'Y' THEN 'E202'
+                                ELSE '1200'
+                            END
+                        ELSE ''
+                    END
+                ELSE ''
+            END
+        """).alias("v_CLASS_CD_Auto_1"),  # Transform
+        expr("CASE WHEN ST_ABBR = 'FL' THEN NISS_CLASS_CD_FL ELSE '' END").alias("v_CLASS_CD_Auto_1A"),  # Transform
+        expr("""
+            CASE 
+                WHEN NOT (ST_ABBR IN ('NY', 'NJ', 'NC', 'MI', 'MT', 'PA')) AND 
+                     IAGE >= 25 AND IAGE < 65 AND NOT (AUTO_USE_CD IN ('HOP', 'HPS', 'PLS', 'STG', 'COM', 'FRM')) THEN
+                    CASE 
+                        WHEN MLT_CAR_IND = 'N' THEN '1400'
+                        ELSE '1402'
+                    END
+                ELSE ''
+            END
+        """).alias("v_CLASS_CD_Auto_2"),  # Transform
+        expr("""
+            CASE 
+                WHEN NOT (ST_ABBR IN ('NY', 'NJ', 'NC', 'MI', 'MT', 'PA')) AND 
+                     RATNG_CMPY_CD IN ('P', 'S', 'E') THEN
+                    CASE 
+                        WHEN IAGE >= 25 AND IAGE < 65 THEN
+                            CASE 
+                                WHEN AUTO_USE_CD IN ('HOP', 'HPS', 'PLS', 'STG', '#') THEN
+                                    CASE 
+                                        WHEN MLT_CAR_IND = 'N' THEN '1210'
+                                        ELSE '1212'
+                                    END
+                                WHEN AUTO_USE_CD = 'FRM' THEN
+                                    CASE 
+                                        WHEN MLT_CAR_IND = 'N' THEN '1213'
+                                        ELSE '1211'
+                                    END
+                                WHEN AUTO_USE_CD = 'COM' THEN
+                                    CASE 
+                                        WHEN IMILES_TO_WRK < 10 THEN
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1220'
+                                                ELSE '1222'
+                                            END
+                                        WHEN IMILES_TO_WRK >= 10 THEN
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1230'
+                                                ELSE '1232'
+                                            END
+                                        ELSE ''
+                                    END
+                                ELSE ''
+                            END
+                        WHEN IAGE < 25 THEN
+                            CASE 
+                                WHEN RT_CLS IN ('08', '18', '28', '38', '48', '58', 'M6', 'M8', 'N6', 'N8') THEN
+                                    CASE 
+                                        WHEN AUTO_USE_CD = 'FRM' THEN
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1613'
+                                                ELSE '1611'
+                                            END
+                                        ELSE
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1610'
+                                                ELSE '1612'
+                                            END
+                                    END
+                                WHEN (SUBSTR(RT_CLS, 2, 1) = '5' OR RT_CLS = '5') AND MRTL_STAT = 'M' THEN
+                                    CASE 
+                                        WHEN AUTO_USE_CD = 'FRM' THEN
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1623'
+                                                ELSE '1621'
+                                            END
+                                        ELSE
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1620'
+                                                ELSE '1622'
+                                            END
+                                    END
+                                WHEN (SUBSTR(RT_CLS, 2, 1) = '2' OR RT_CLS = '2') AND MRTL_STAT = 'S' THEN
+                                    CASE 
+                                        WHEN AUTO_USE_CD = 'FRM' THEN
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1633'
+                                                ELSE '1631'
+                                            END
+                                        ELSE
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1630'
+                                                ELSE '1632'
+                                            END
+                                    END
+                                WHEN (SUBSTR(LTRIM(RTRIM(RT_CLS)), 2, 1) = '2' OR RT_CLS = '2') AND 
+                                     (LTRIM(RTRIM(MRTL_STAT)) = '' OR MRTL_STAT IS NULL) AND 
+                                     (LTRIM(RTRIM(GENDR)) = '' OR GENDR IS NULL) AND 
+                                     NOT (AUTO_USE_CD IN ('FRM')) THEN
+                                    CASE 
+                                        WHEN MLT_CAR_IND = 'N' THEN 'E630'
+                                        ELSE 'E632'
+                                    END
+                                WHEN GENDR = 'F' THEN
+                                    CASE 
+                                        WHEN AUTO_USE_CD = 'FRM' THEN
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1643'
+                                                ELSE '1641'
+                                            END
+                                        ELSE
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1640'
+                                                ELSE '1642'
+                                            END
+                                    END
+                                WHEN GENDR = 'M' THEN
+                                    CASE 
+                                        WHEN NOT (AUTO_USE_CD IN ('FRM')) THEN
+                                            CASE 
+                                                WHEN MLT_CAR_IND = 'N' THEN '1610'
+                                                ELSE '1612'
+                                            END
+                                        ELSE
+                                            CASE 
+                                                WHEN NOT (AUTO_USE_CD IN ('FRM')) THEN
+                                                    CASE 
+                                                        WHEN MLT_CAR_IND = 'N' THEN 'E610'
+                                                        ELSE 'E612'
+                                                    END
+                                                ELSE
+                                                    CASE 
+                                                        WHEN GENDR = 'U' OR LTRIM(RTRIM(GENDR)) = '' THEN
+                                                            CASE 
+                                                                WHEN MLT_CAR_IND = 'N' THEN 'E600'
+                                                                ELSE 'E602'
+                                                            END
+                                                        ELSE ''
+                                                    END
+                                            END
+                                    END
+                                ELSE ''
+                            END
+                        ELSE ''
+                    END
+                ELSE ''
+            END
+        """).alias("v_CLASS_CD_Auto_3"),  # Transform
+        # Additional transformations can be added here following the same pattern
+    )
+
+    # Write transformed data to Unity Catalog target table
+    logger.info("Writing transformed data to Unity Catalog target table...")
+    spark.sql("DROP TABLE IF EXISTS catalog.target_db.target_table")
+    transformed_df.write.format("delta").mode("overwrite").saveAsTable("catalog.target_db.target_table")
+
+    logger.info("ETL process completed successfully.")
+
+except Exception as e:
+    logger.error(f"An error occurred during the ETL process: {e}")
+    raise
