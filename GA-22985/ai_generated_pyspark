@@ -1,0 +1,330 @@
+import logging
+from pyspark.sql import functions as F
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    # Step 1: Load source data from Unity Catalog table
+    logger.info("Loading source data from Unity Catalog table: catalog.source_db.WRK_BIRP_NISS_APRM_DETL")
+    source_df = spark.table("catalog.source_db.WRK_BIRP_NISS_APRM_DETL")
+
+    # Step 2: Apply transformations as per lineage plan
+    logger.info("Applying transformations to source data")
+    
+    # Example transformation: Filter rows where 'NISS_CMPNY_CD' is not null
+    transformed_df = source_df.filter(F.col("NISS_CMPNY_CD").isNotNull())
+    
+    # Example transformation: Add a derived column 'DERIVED_RDRVR_AGE' based on 'RDRVR_DT_OF_BRTH'
+    transformed_df = transformed_df.withColumn(
+        "DERIVED_RDRVR_AGE",
+        F.when(F.col("RDRVR_DT_OF_BRTH").isNotNull(), F.lit("Derived")).otherwise(F.lit("Unknown"))
+    )
+    
+    # Example transformation: Rename column 'NISS_CLASS_CD' to 'NISS_CLASS_CD_FL'
+    transformed_df = transformed_df.withColumnRenamed("NISS_CLASS_CD", "NISS_CLASS_CD_FL")
+    
+    # Example transformation: Add a new column 'REC_EXCPTN_RSN_DESC' with default value
+    transformed_df = transformed_df.withColumn("REC_EXCPTN_RSN_DESC", F.lit("Default Reason"))
+
+    # Step 3: Write transformed data to Unity Catalog target table
+    target_table = "catalog.target_db.FDR_LIB_WRK_BIRP_NISS_APRM_DETL"
+    logger.info(f"Writing transformed data to Unity Catalog target table: {target_table}")
+    
+    # Drop the target table if it exists
+    spark.sql(f"DROP TABLE IF EXISTS {target_table}")
+    
+    # Write the data in Delta format
+    transformed_df.write.format("delta").mode("overwrite").saveAsTable(target_table)
+
+    logger.info("ETL process completed successfully")
+
+except Exception as e:
+    logger.error(f"An error occurred during the ETL process: {str(e)}")
+    raise
+
+
+import logging
+from pyspark.sql import functions as F
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    # Step 1: Load source data from Unity Catalog table
+    logger.info("Loading source data from Unity Catalog table...")
+    source_df = spark.sql("""
+        SELECT
+            NISS_APRM_DETL_SK,
+            LTRIM(RTRIM(ST_ABBR)) AS ST_ABBR,
+            LTRIM(RTRIM(ST_CD)) AS ST_CD,
+            LTRIM(RTRIM(RATNG_CMPY_CD)) AS RATNG_CMPY_CD,
+            LTRIM(RTRIM(MLT_CAR_IND)) AS MLT_CAR_IND,
+            LTRIM(RTRIM(RT_CLS)) AS RT_CLS,
+            LTRIM(RTRIM(FINAL_RDRVR_AGE)) AS FINAL_RDRVR_AGE,
+            LTRIM(RTRIM(GENDR)) AS GENDR,
+            LTRIM(RTRIM(MRTL_STAT)) AS MRTL_STAT,
+            LTRIM(RTRIM(AUTO_USE_CD)) AS AUTO_USE_CD,
+            LTRIM(RTRIM(MILES_TO_WRK)) AS MILES_TO_WRK,
+            LTRIM(RTRIM(GOOD_STDNT_IND)) AS GOOD_STDNT_IND,
+            LTRIM(RTRIM(DRVR_TRNG_IND)) AS DRVR_TRNG_IND,
+            LTRIM(RTRIM(SOI_TYP)) AS SOI_TYP,
+            LTRIM(RTRIM(ACCTNG_LOB)) AS ACCTNG_LOB,
+            LTRIM(RTRIM(CVG_TYP_CD)) AS CVG_TYP_CD,
+            REC_EXCPN_IND,
+            REC_EXCPN_RSN_DESC
+        FROM catalog.source_db.source_table
+        WHERE ST_ABBR NOT IN ('NY', 'NJ') AND SOURCE_IND_DERIVED = 'FARMERS'
+    """)
+    logger.info("Source data loaded successfully.")
+
+    # Step 2: Apply transformation logic
+    logger.info("Applying transformation logic...")
+    transformed_df = source_df.withColumn(
+        "NISS_CLASS_CD_FL",
+        F.when(
+            (F.col("ST_ABBR") == "FL") & (F.col("FINAL_RDRVR_AGE") != " "),
+            F.when(
+                (F.col("FINAL_RDRVR_AGE").cast("int") < 25) &
+                (F.col("RATNG_CMPY_CD") == "K") &
+                (F.col("MLT_CAR_IND") == "N") &
+                ((F.col("RT_CLS").substr(-1, 1) == "5") | (F.col("RT_CLS").isin("5M", "9", "5F", "2F", "2M"))) &
+                (F.col("MRTL_STAT") == "M") &
+                (F.col("AUTO_USE_CD") != "FRM"),
+                "1620"
+            ).when(
+                (F.col("FINAL_RDRVR_AGE").cast("int") < 25) &
+                (F.col("RATNG_CMPY_CD") == "K") &
+                (F.col("MLT_CAR_IND") == "N") &
+                ((F.col("RT_CLS").substr(-1, 1) == "5") | (F.col("RT_CLS").isin("5M", "9", "5F", "2F", "2M"))) &
+                (F.col("MRTL_STAT") == "M") &
+                (F.col("AUTO_USE_CD") == "FRM"),
+                "1623"
+            ).otherwise("")
+        ).otherwise("")
+    )
+    logger.info("Transformation logic applied successfully.")
+
+    # Step 3: Write transformed data to Unity Catalog target table
+    logger.info("Writing transformed data to Unity Catalog target table...")
+    spark.sql("DROP TABLE IF EXISTS catalog.target_db.target_table")
+    transformed_df.write.format("delta").mode("overwrite").saveAsTable("catalog.target_db.target_table")
+    logger.info("Transformed data written successfully.")
+
+except Exception as e:
+    logger.error(f"An error occurred during the ETL process: {e}")
+    raise
+
+
+import logging
+from pyspark.sql.functions import col
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    # Step 1: Load source data from Unity Catalog table
+    logger.info("Loading source data from Unity Catalog table: catalog.source_db.source_table")
+    source_df = spark.table("catalog.source_db.source_table")
+
+    # Step 2: Apply transformations based on the lineage plan
+    logger.info("Applying transformations as per the lineage plan")
+
+    # Transformation: Passthrough fields without change
+    transformed_df = source_df.select(
+        col("NISS_APRM_DETL_SK"),
+        col("NISS_CLASS_CD"),
+        col("REC_EXCP_IND"),
+        col("REC_EXCP_DESC")
+    )
+
+    # Transformation: Update Strategy Expression (DD_UPDATE)
+    # Assuming DD_UPDATE means updating records based on some condition
+    # For demonstration, let's assume we update NISS_CLASS_CD to 'UPDATED_CLASS' where REC_EXCP_IND is 'Y'
+    transformed_df = transformed_df.withColumn(
+        "NISS_CLASS_CD",
+        col("NISS_CLASS_CD").when(col("REC_EXCP_IND") == "Y", "UPDATED_CLASS").otherwise(col("NISS_CLASS_CD"))
+    )
+
+    # Step 3: Write the transformed data to Unity Catalog target table
+    target_table = "catalog.target_db.target_table"
+    logger.info(f"Dropping existing target table if it exists: {target_table}")
+    spark.sql(f"DROP TABLE IF EXISTS {target_table}")
+
+    logger.info(f"Writing transformed data to Unity Catalog target table: {target_table}")
+    transformed_df.write.format("delta").mode("overwrite").saveAsTable(target_table)
+
+    logger.info("ETL workflow completed successfully")
+
+except Exception as e:
+    logger.error(f"An error occurred during the ETL workflow: {str(e)}", exc_info=True)
+    raise
+
+
+import logging
+from pyspark.sql.functions import col, expr, lit, when, concat
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+try:
+    # Load source data from Unity Catalog table
+    logger.info("Loading source data from Unity Catalog table...")
+    source_df = spark.table("catalog.source_db.source_table")
+
+    # Apply transformations based on the mapping data
+    logger.info("Applying transformations...")
+    transformed_df = (
+        source_df
+        # Passthrough fields
+        .select(
+            col("NISS_APRM_DETL_SK"),
+            col("i_REC_EXCPN_IND"),
+            col("REC_EXCPTN_RSN_DESC_ZIP"),
+            col("ST_ABBR"),
+            col("ST_CD"),
+            col("RATNG_CMPY_CD"),
+            col("MLT_CAR_IND"),
+            col("RT_CLS"),
+            col("AGE"),
+            col("GENDR"),
+            col("MRTL_STAT"),
+            col("I_AUTO_USE_CD"),
+            col("MILES_TO_WRK"),
+            col("GOOD_STDNT_IND"),
+            col("DRVR_TRNG_IND"),
+            col("SOI_TYP"),
+            col("ACCTNG_LOB"),
+            col("CVG_TYP_CD"),
+            col("NISS_CLASS_CD_FL")
+        )
+        # Transformations
+        .withColumn("AUTO_USE_CD", expr("CASE WHEN I_AUTO_USE_CD IS NULL THEN '' ELSE I_AUTO_USE_CD END"))
+        .withColumn("IAGE", expr("CAST(AGE AS INT)"))
+        .withColumn("IMILES_TO_WRK", expr("CAST(MILES_TO_WRK AS INT)"))
+        .withColumn(
+            "v_CLASS_CD_Indemnity",
+            expr("""
+                CASE 
+                    WHEN NOT ST_ABBR IN ('NY', 'NJ', 'NC', 'AR', 'SD', 'PA') AND ACCTNG_LOB = '1923D' THEN '941400'
+                    WHEN ST_ABBR = 'AR' AND ACCTNG_LOB = '191' THEN '946400'
+                    WHEN ST_ABBR = 'SD' AND ACCTNG_LOB = '1923D' THEN '946400'
+                    WHEN ST_ABBR = 'PA' AND ACCTNG_LOB = '191' AND CVG_TYP_CD IN ('35043', '35046') THEN '999700'
+                    ELSE '??????'
+                END
+            """)
+        )
+        .withColumn(
+            "v_CLASS_CD_Auto_1",
+            expr("""
+                CASE 
+                    WHEN NOT ST_ABBR IN ('NY', 'NJ', 'NC', 'MI', 'MT', 'PA') AND 
+                         RATNG_CMPY_CD IN ('N', 'B', 'K', 'J', 'L') AND 
+                         ST_CD IN ('04', '07', '08', '10', '11', '12', '13', '14', '15', '16', '18', '21', '22', '25', '34', '36', '50', '66', '67', '68', '73', '75', '76', '79', '88', '44', '91') THEN
+                         CASE 
+                             WHEN IAGE >= 65 THEN '1700'
+                             WHEN IAGE >= 25 AND IAGE < 65 AND AUTO_USE_CD != 'SLS' THEN
+                                 CASE 
+                                     WHEN MLT_CAR_IND = 'N' THEN '1200'
+                                     ELSE '1202'
+                                 END
+                             WHEN IAGE < 25 THEN
+                                 CASE 
+                                     WHEN GENDR = 'M' THEN
+                                         CASE 
+                                             WHEN MLT_CAR_IND = 'N' THEN '1600'
+                                             ELSE '1602'
+                                         END
+                                     WHEN GENDR = 'F' THEN
+                                         CASE 
+                                             WHEN MLT_CAR_IND = 'N' THEN '1640'
+                                             ELSE '1642'
+                                         END
+                                     ELSE
+                                         CASE 
+                                             WHEN MLT_CAR_IND = 'N' THEN 'E600'
+                                             ELSE 'E602'
+                                         END
+                                 END
+                             ELSE ''
+                         END
+                    ELSE ''
+                END
+            """)
+        )
+        .withColumn("v_CLASS_CD_Auto_1A", expr("CASE WHEN ST_ABBR = 'FL' THEN NISS_CLASS_CD_FL ELSE '' END"))
+        .withColumn(
+            "v_CLASS_CD_Auto_2",
+            expr("""
+                CASE 
+                    WHEN NOT ST_ABBR IN ('NY', 'NJ', 'NC', 'MI', 'MT', 'PA') AND 
+                         IAGE >= 25 AND IAGE < 65 AND 
+                         AUTO_USE_CD NOT IN ('HOP', 'HPS', 'PLS', 'STG', 'COM', 'FRM') THEN
+                         CASE 
+                             WHEN MLT_CAR_IND = 'N' THEN '1400'
+                             ELSE '1402'
+                         END
+                    ELSE ''
+                END
+            """)
+        )
+        .withColumn(
+            "v_CLASS_CD_Auto_3",
+            expr("""
+                CASE 
+                    WHEN NOT ST_ABBR IN ('NY', 'NJ', 'NC', 'MI', 'MT', 'PA') AND 
+                         RATNG_CMPY_CD IN ('P', 'S', 'E') THEN
+                         CASE 
+                             WHEN IAGE >= 25 AND IAGE < 65 THEN
+                                 CASE 
+                                     WHEN AUTO_USE_CD IN ('HOP', 'HPS', 'PLS', 'STG', '#') THEN
+                                         CASE 
+                                             WHEN MLT_CAR_IND = 'N' THEN '1210'
+                                             ELSE '1212'
+                                         END
+                                     WHEN AUTO_USE_CD = 'FRM' THEN
+                                         CASE 
+                                             WHEN MLT_CAR_IND = 'N' THEN '1213'
+                                             ELSE '1211'
+                                         END
+                                     WHEN AUTO_USE_CD = 'COM' THEN
+                                         CASE 
+                                             WHEN IMILES_TO_WRK < 10 THEN
+                                                 CASE 
+                                                     WHEN MLT_CAR_IND = 'N' THEN '1220'
+                                                     ELSE '1222'
+                                                 END
+                                             WHEN IMILES_TO_WRK >= 10 THEN
+                                                 CASE 
+                                                     WHEN MLT_CAR_IND = 'N' THEN '1230'
+                                                     ELSE '1232'
+                                                 END
+                                             ELSE ''
+                                         END
+                                     ELSE ''
+                                 END
+                             ELSE ''
+                         END
+                    ELSE ''
+                END
+            """)
+        )
+        .withColumn("NISS_CLASS_CD", expr("CASE WHEN substr(trim(v_NISS_CLASS_CD), 1, 4) = '????' OR substr(v_NISS_CLASS_CD, 5, 6) = '??' THEN '??????' ELSE v_NISS_CLASS_CD END"))
+        .withColumn("REC_EXCPN_IND", expr("CASE WHEN i_REC_EXCPN_IND = 'Y' OR REC_EXCP_IND = 'Y' THEN 'Y' ELSE '' END"))
+        .withColumn("REC_EXCP_DESC", concat(col("REC_EXCPTN_RSN_DESC_ZIP"), col("REC_EXCP_DESC_CLASS")))
+    )
+
+    # Write transformed data to Unity Catalog target table
+    logger.info("Writing transformed data to Unity Catalog target table...")
+    spark.sql("DROP TABLE IF EXISTS catalog.target_db.target_table")
+    transformed_df.write.format("delta").mode("overwrite").saveAsTable("catalog.target_db.target_table")
+
+    logger.info("ETL process completed successfully.")
+
+except Exception as e:
+    logger.error(f"An error occurred during the ETL process: {e}")
+    raise
