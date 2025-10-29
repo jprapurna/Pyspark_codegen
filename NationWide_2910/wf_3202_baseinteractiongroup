@@ -1,0 +1,530 @@
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("m_3202_wk_fnd_baseinteractiongroup")
+
+# Configuration
+CATALOG = "BaseInteractionGroup"
+WORK_SCHEMA = "Work"
+FND_SCHEMA = "FND_EINTR_DB"
+PARAMS = {
+    "$$interaction_work_db": f"{CATALOG}.{WORK_SCHEMA}",
+    "$$interaction_fnd_db": f"{CATALOG}.{FND_SCHEMA}",
+    "$$load_event_id": "LoadEvent_Id"
+}
+
+BIG_END = F.lit('3500-01-01')
+DEC_BIG_END = F.lit(999999999999999999)
+
+def run_m_3202_wk_fnd_baseinteractiongroup():
+    try:
+        # T1 — SQ_SAF_BaseInteractiongroup_for_get_min_date
+        logger.info("Executing T1: SQ_SAF_BaseInteractiongroup_for_get_min_date")
+        sql_query_t1 = f"""
+        SELECT
+            InteractionGroup_Id,
+            MAX(KeepSequence_It) OVER (PARTITION BY InteractionGroup_Id ORDER BY SequenceStart_It, LoadEvent_Id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS SequenceStart_It,
+            Effective_Dt,
+            MAX(KeepLoadEvent_It) OVER (PARTITION BY InteractionGroup_Id ORDER BY SequenceStart_It, LoadEvent_Id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS LoadEvent_Id
+        FROM (
+            SELECT
+                InteractionGroup_Id,
+                SequenceStart_It,
+                Effective_Dt,
+                Rank_It,
+                LoadEvent_Id,
+                COALESCE(Rank_It - SUM(Rank_It) OVER (PARTITION BY InteractionGroup_Id ORDER BY SequenceStart_It, LoadEvent_Id ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING), Rank_It) AS Rank_Diff,
+                CASE WHEN Rank_Diff <> 0 THEN SequenceStart_It END AS KeepSequence_It,
+                CASE WHEN Rank_Diff <> 0 THEN LoadEvent_Id END AS KeepLoadEvent_It
+            FROM (
+                SELECT
+                    InteractionGroup_Id,
+                    SequenceStart_It,
+                    Effective_Dt,
+                    LoadEvent_Id,
+                    RANK() OVER (PARTITION BY InteractionGroup_Id ORDER BY Chksum_BaseInteractionGroup) AS Rank_It
+                FROM {PARAMS["$$interaction_work_db"]}.saf_baseinteractiongroup
+                WHERE LoadFlag_BaseInteractionGroup <> 'I'
+            ) rankbaseinteractiongroup
+        ) ranksequence
+        """
+        df_t1 = spark.sql(sql_query_t1)
+        df_t1.createOrReplaceTempView("SQ_SAF_BaseInteractiongroup_for_get_min_date")
+        logger.info(f"T1 row count: {df_t1.count()}, schema: {df_t1.printSchema()}")
+        df_t1.show(5, truncate=False)
+
+        # T2 — agg_min_eff_dt_min_loadevent_id
+        logger.info("Executing T2: agg_min_eff_dt_min_loadevent_id")
+        df_t2 = df_t1.groupBy("InteractionGroup_Id", "SequenceStart_It").agg(
+            F.min("Effective_Dt").alias("min_effective_dt"),
+            F.min("LoadEvent_Id").alias("min_LoadEvent_Id")
+        )
+        df_t2.createOrReplaceTempView("agg_min_eff_dt_min_loadevent_id")
+        logger.info(f"T2 row count: {df_t2.count()}, schema: {df_t2.printSchema()}")
+        df_t2.show(5, truncate=False)
+
+        # T3 — SQ_SAF_baseinteractiongroup
+        logger.info("Executing T3: SQ_SAF_baseinteractiongroup")
+        df_t3 = spark.table(f"{PARAMS['$$interaction_work_db']}.SAF_BaseInteractionGroup")
+        df_t3.createOrReplaceTempView("SQ_SAF_baseinteractiongroup")
+        logger.info(f"T3 row count: {df_t3.count()}, schema: {df_t3.printSchema()}")
+        df_t3.show(5, truncate=False)
+
+        # T4 — jnr_dedup_intra_day
+        logger.info("Executing T4: jnr_dedup_intra_day")
+        df_t4 = df_t3.join(
+            df_t2,
+            (df_t3["InteractionGroup_Id"] == df_t2["InteractionGroup_Id"]) &
+            (df_t3["SequenceStart_It"] == df_t2["SequenceStart_It"]) &
+            (df_t3["LoadEvent_Id"] == df_t2["min_LoadEvent_Id"]),
+            "inner"
+        )
+        df_t4.createOrReplaceTempView("jnr_dedup_intra_day")
+        logger.info(f"T4 row count: {df_t4.count()}, schema: {df_t4.printSchema()}")
+        df_t4.show(5, truncate=False)
+
+        # T5 — Fil_LoadFlag
+        logger.info("Executing T5: Fil_LoadFlag")
+        df_t5 = df_t4.filter(df_t4["LoadFlag_BaseInteractionGroup"] == 'Y')
+        df_t5.createOrReplaceTempView("Fil_LoadFlag")
+        logger.info(f"T5 row count: {df_t5.count()}, schema: {df_t5.printSchema()}")
+        df_t5.show(5, truncate=False)
+
+        # T6 — BaseInteractionGroup (Target)
+        logger.info("Executing T6: BaseInteractionGroup (Target)")
+        target_fqn = f"{CATALOG}.{FND_SCHEMA}.BaseInteractionGroup"
+        target_columns = [
+            "BaseInteractionGroup_Id", "InteractionGroup_Id", "InteractionGroupKey_Cd",
+            "InteractionGroupBusinessKey_Id", "InteractionGroupBusinessKey_Cd",
+            "InteractionGrpLogiclBusnKey_Id", "InteractionGrpLogiclBusnKey_Cd",
+            "InteractionThread_Id", "InteractionThreadKey_Cd", "PartyKey_Cd",
+            "AgentOfRecord_Nb", "AgentOfRecord_Nm", "AgentOfRecordSource_Cd",
+            "AgentOfRecordPhone_Nb", "AlternateTelephone_Nb", "AnalyticHousehold_Nb",
+            "AnalyticParty_Nb", "BestContactTime_Cd", "BestContactTime_Tp",
+            "BillingAccount_Nb", "BusinessName_Ds", "CallBack_Ts", "CommercialPGIndustry_Ds",
+            "CommercialPGOtherIndustry_Ds", "CommercialPGYearsInBusiness_Ds",
+            "CommercialPGCurrentInsured_Cd", "CommercialPGCurrentInsured_Tp",
+            "CommercialPGOtherProducts_Ds", "ContactPrefix_Nm", "ContactFirst_Nm",
+            "ContactMiddle_Nm", "ContactLast_Nm", "ContactFull_Nm", "ContactSuffix_Nm",
+            "EmailAddress_Nm", "EnterpriseCustomer_Nb", "ECIFContact_Nb", "FullPolicy_Nb",
+            "FullTermPremium_Am", "InteractionProduct_Cd", "InteractionProduct_Tp",
+            "Language_Ds", "OperationalHousehold_Nb", "PartyLifecycleStatus_Cd",
+            "PartyLifecycleStatus_Tp", "PolicyEffective_Dt", "PolicyPremiumChange_Am",
+            "PolicyPremiumChange_Pc", "PolicyProcessingPlatform_Nm", "PolicyRenewal_Dt",
+            "PolicyRenewalPremium_Am", "PolicyType_Cd", "PolicyType_Tp",
+            "PreferredTelephone_Nb", "Quote_Nb", "QuoteEvent_Nb", "QuotePlatform_Nm",
+            "RatedState_Cd", "RatedState_Tp", "TimeZone_Cd", "Zip_Cd", "Effective_Dt",
+            "Expiration_Dt", "Transaction_Ts", "Revision_Ts", "SequenceStart_It",
+            "SequenceEnd_It", "Source_Cd", "LoadEvent_Id", "InfaMd5_Nb",
+            "AgencyOfRecord_Nb", "HouseholdBusinessKey_Id", "HouseholdBusinessKey_Cd",
+            "ActivePnCPolicyOwner_Cd", "ActivePnCPolicyOwner_Tp", "CallEligibility_Cd",
+            "CallEligibility_Tp", "ContactBirth_Dt", "ContactGender_Cd", "ContactGender_Tp",
+            "ContactPermitted_Cd", "ContactPermitted_Tp", "ContactSmokerStatus_Cd",
+            "ContactSmokerStatus_Tp", "InteractionAddlProduct_Ds", "InteractionAuto_Cd",
+            "InteractionAuto_Tp", "InteractionBusinessAuto_Cd", "InteractionBusinessAuto_Tp",
+            "InteractionBusinessLiab_Cd", "InteractionBusinessLiab_Tp",
+            "InteractionBusinessProperty_Cd", "InteractionBusinessProperty_Tp",
+            "InteractionCondominium_Cd", "InteractionCondominium_TP",
+            "InteractionHomeowners_Cd", "InteractionHomeowners_Tp", "InteractionIDTheft_Cd",
+            "InteractionIDTheft_Tp", "InteractionLifeEvent_Ds", "InteractionMotorcycle_Cd",
+            "InteractionMotorcycle_Tp", "InteractionRenters_Cd", "InteractionRenters_Tp",
+            "LapseInCoverage_Cd", "LapseInCoverage_Tp", "PriorCarrier_Nm",
+            "QuoteLifeCycleStatus_Cd", "QuoteLifeCycleStatus_Tp", "Opportunity_Nb",
+            "OpportunityDetail_Nb", "AgencyOfRecord_Nm", "TargetKeyLevel_Cd",
+            "TargetKeyLevel_Tp", "AnalyticDistrPartner_Id", "DistrPartnerRelationship_Id",
+            "DistrPartnerSalesTerritory_Id", "AgreementRole_Id", "DistrPartner_Nb",
+            "SalesTerritory_Cd"
+        ]
+        df_final = df_t5.select(*target_columns)
+        df_final.write.format("delta").mode("overwrite").saveAsTable(target_fqn)
+        logger.info(f"T6 write completed to {target_fqn}")
+
+    except Exception as e:
+        logger.exception("Error occurred during mapping execution")
+        raise
+
+
+import logging
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
+# Initialize logger
+logger = logging.getLogger("m_3202_saf_wk_baseinteractiongroup")
+logger.setLevel(logging.INFO)
+
+# Configuration constants
+CATALOG = "BaseInteractionGroup"
+WORK_SCHEMA = "work_schema"
+FND_SCHEMA = "fnd_schema"
+PARAMS = {
+    "$$working_dir": "/mnt/data",
+    "$InputFileNameList": "input_file_list",
+}
+
+# Utility constants
+BIG_END = F.lit('3500-01-01')
+DEC_BIG_END = F.lit(999999999999999999)
+
+# Helper functions
+def apply_lookup_with_fallback(df, lookup_table, key_col, lookup_col, default_value):
+    """Perform a left join lookup and fallback to default value if not found."""
+    lookup_df = spark.table(lookup_table).select(key_col, lookup_col)
+    return df.join(lookup_df, df[key_col] == lookup_df[key_col], "left_outer") \
+             .withColumn(lookup_col, F.coalesce(F.col(lookup_col), F.lit(default_value)))
+
+def substitute_params(sql_query):
+    """Substitute $$variables in SQL query."""
+    for param, value in PARAMS.items():
+        sql_query = sql_query.replace(param, value)
+    return sql_query
+
+def require_cols(df, required_cols):
+    """Ensure required columns exist in DataFrame."""
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+# Main mapping function
+def run_m_3202_saf_wk_baseinteractiongroup():
+    try:
+        # T1 — SQ_File_SAF_Baseinteractiongroup
+        logger.info("Starting T1 — SQ_File_SAF_Baseinteractiongroup")
+        source_path = f"{PARAMS['$$working_dir']}/{PARAMS['$InputFileNameList']}"
+        schema = StructType([
+            StructField("LoadEvent_Id", DecimalType(18, 0)),
+            StructField("InteractionGroupKey_Cd", StringType()),
+            StructField("InteractionGroupBusinessKey_Cd", StringType()),
+            StructField("InteractionThreadKey_Cd", StringType()),
+            StructField("PartyKey_Cd", StringType()),
+            StructField("AgentOfRecord_Nb", StringType()),
+            StructField("AgentOfRecord_Nm", StringType()),
+            StructField("AgentOfRecordSource_Cd", StringType()),
+            StructField("AgentOfRecordPhone_Nb", StringType()),
+            StructField("AlternateTelephone_Nb", StringType()),
+            StructField("BestContactTime_Cd", StringType()),
+            StructField("BestContactTimeTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("BusinessName_Ds", StringType()),
+            StructField("CallBack_Ts", TimestampType()),
+            StructField("CommercialPGIndustry_Ds", StringType()),
+            StructField("CommercialPGOtherIndustry_Ds", StringType()),
+            StructField("CommercialPGYearsInBusiness_Ds", StringType()),
+            StructField("CommercialPGCurrentInsured_Cd", StringType()),
+            StructField("CommercialPGCurrentInsuredTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("CommercialPGOtherProducts_Ds", StringType()),
+            StructField("ContactFirst_Nm", StringType()),
+            StructField("ContactLast_Nm", StringType()),
+            StructField("ContactFull_Nm", StringType()),
+            StructField("EmailAddress_Nm", StringType()),
+            StructField("EnterpriseCustomer_Nb", StringType()),
+            StructField("EcifContact_Nb", StringType()),
+            StructField("FullPolicy_Nb", StringType()),
+            StructField("Language_Ds", StringType()),
+            StructField("OperationalHousehold_Nb", StringType()),
+            StructField("PartyLifecycleStatus_Cd", StringType()),
+            StructField("PartyLifecycleStatusTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("PolicyProcessingPlatform_Nm", StringType()),
+            StructField("PreferredTelephone_Nb", StringType()),
+            StructField("Quote_Nb", StringType()),
+            StructField("QuotePlatform_Nm", StringType()),
+            StructField("RatedState_Cd", StringType()),
+            StructField("RatedStateTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("TimeZone_Cd", StringType()),
+            StructField("Zip_Cd", StringType()),
+            StructField("Effective_Dt", TimestampType()),
+            StructField("Expiration_Dt", TimestampType()),
+            StructField("Transaction_Ts", TimestampType()),
+            StructField("Revision_Ts", TimestampType()),
+            StructField("SequenceStart_It", DecimalType(18, 0)),
+            StructField("SequenceEnd_It", DecimalType(18, 0)),
+            StructField("Source_Cd", StringType()),
+            StructField("InteractionGrpLogiclBusnKey_Cd", StringType()),
+            StructField("AnalyticHousehold_Nb", StringType()),
+            StructField("AnalyticParty_Nb", StringType()),
+            StructField("BillingAccount_Nb", StringType()),
+            StructField("ContactPrefix_Nm", StringType()),
+            StructField("ContactMiddle_Nm", StringType()),
+            StructField("ContactSuffix_Nm", StringType()),
+            StructField("InteractionProduct_Cd", StringType()),
+            StructField("InteractionProductTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("PolicyEffective_Dt", TimestampType()),
+            StructField("PolicyPremiumChange_Am", DecimalType(9, 2)),
+            StructField("PolicyPremiumChange_Pc", DecimalType(6, 2)),
+            StructField("PolicyRenewal_Dt", TimestampType()),
+            StructField("PolicyRenewalPremium_Am", DecimalType(9, 2)),
+            StructField("PolicyType_Cd", StringType()),
+            StructField("PolicyTypeTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("QuoteEvent_Nb", StringType()),
+            StructField("FullTermPremium_Am", DecimalType(18, 2)),
+            StructField("AgencyOfRecord_Nb", StringType()),
+            StructField("HouseholdBusinessKey_Cd", StringType()),
+            StructField("Opportunity_Nb", StringType()),
+            StructField("OpportunityDetail_Nb", StringType()),
+            StructField("ActivePnCPolicyOwner_Cd", StringType()),
+            StructField("ActivePnCPolicyOwnerTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("CallEligibility_Cd", StringType()),
+            StructField("CallEligibilityTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("ContactBirth_Dt", TimestampType()),
+            StructField("ContactGender_Cd", StringType()),
+            StructField("ContactGenderTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("ContactPermitted_Cd", StringType()),
+            StructField("ContactPermittedTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("ContactSmokerStatus_Cd", StringType()),
+            StructField("ContactSmokerStatusTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("InteractionAddlProduct_Ds", StringType()),
+            StructField("InteractionAuto_Cd", StringType()),
+            StructField("InteractionAutoTranslationRuleTable_Id", DecimalType(5, 0)),
+            StructField("InteractionBusinessAuto_Cd", StringType()),
+            StructField("InteractionBusiness
+
+from pyspark.sql import functions as F
+from pyspark.sql.utils import AnalysisException
+import logging
+
+# Initialize logger
+logger = logging.getLogger("m_3202_dt_chn_baseinteractiongroup")
+logger.setLevel(logging.INFO)
+
+# Configuration
+CATALOG = "BaseInteractionGroup"
+WORK_SCHEMA = "interaction_work_db"
+FND_SCHEMA = "interaction_fnd_db"
+PARAMS = {
+    "$$interaction_work_db": f"{CATALOG}.{WORK_SCHEMA}",
+    "$$interaction_fnd_db": f"{CATALOG}.{FND_SCHEMA}"
+}
+BIG_END = F.lit('3500-01-01')
+DEC_BIG_END = F.lit(350036535003659999)
+
+def run_m_3202_dt_chn_baseinteractiongroup():
+    """
+    Executes the mapping logic for m_3202_dt_chn_baseinteractiongroup.
+    """
+    try:
+        # T1 — SQ_Override_DateChain
+        logger.info("Starting T1: SQ_Override_DateChain")
+        sql_query = f"""
+        SELECT
+            O.BaseInteractionGroup_Id,
+            O.InteractionGroup_Id,
+            O.Source_Cd,
+            O.NewExpiration_Dt,
+            O.NewRevision_Ts,
+            O.NewSequenceEnd_It
+        FROM (
+            SELECT
+                BaseInteractionGroup_Id,
+                InteractionGroup_Id,
+                Source_Cd,
+                COALESCE(
+                    MIN(Effective_Dt) OVER (
+                        PARTITION BY InteractionGroup_Id
+                        ORDER BY Effective_Dt ASC, SequenceStart_It ASC
+                        ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+                    ),
+                    DATE '3500-01-01'
+                ) AS NewExpiration_Dt,
+                COALESCE(
+                    MIN(Transaction_Ts) OVER (
+                        PARTITION BY InteractionGroup_Id
+                        ORDER BY Transaction_Ts ASC, SequenceStart_It ASC
+                        ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+                    ),
+                    TIMESTAMP '3500-01-01 00:00:00.000000'
+                ) AS NewRevision_Ts,
+                COALESCE(
+                    MIN(SequenceStart_It) OVER (
+                        PARTITION BY InteractionGroup_Id
+                        ORDER BY SequenceStart_It ASC
+                        ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+                    ),
+                    350036535003659999
+                ) AS NewSequenceEnd_It
+            FROM {PARAMS["$$interaction_fnd_db"]}.BaseInteractionGroup tgt
+            WHERE EXISTS (
+                SELECT 1
+                FROM {PARAMS["$$interaction_work_db"]}.Saf_BaseInteractionGroup tgt1
+                WHERE tgt.InteractionGroup_Id = tgt1.InteractionGroup_Id
+                  AND tgt.Source_Cd = tgt1.Source_Cd
+            )
+            QUALIFY NOT (
+                Expiration_Dt = NewExpiration_Dt
+                AND Revision_Ts = NewRevision_Ts
+                AND SequenceEnd_It = NewSequenceEnd_It
+            )
+        ) O
+        """
+        df_t1 = spark.sql(sql_query)
+        df_t1.createOrReplaceTempView("SQ_Override_DateChain")
+        logger.info(f"T1 completed: row_count={df_t1.count()}, schema={df_t1.schema}")
+        df_t1.limit(5).show(truncate=False)
+
+        # T2 — Target Write
+        logger.info("Starting T2: Target Write")
+        target_fqn = f"{CATALOG}.{FND_SCHEMA}.BaseInteractionGroup"
+        target_cols = [
+            "BaseInteractionGroup_Id", "InteractionGroup_Id", "Source_Cd",
+            "NewExpiration_Dt", "NewRevision_Ts", "NewSequenceEnd_It"
+        ]
+        df_final = df_t1.select(*target_cols)
+        try:
+            # Ensure target table exists
+            spark.sql(f"CREATE TABLE IF NOT EXISTS {target_fqn} USING DELTA AS SELECT * FROM SQ_Override_DateChain WHERE 1=0")
+        except AnalysisException as e:
+            logger.warning(f"Table creation failed: {e}")
+
+        # Write to target table
+        from delta.tables import DeltaTable
+        delta_table = DeltaTable.forName(spark, target_fqn)
+        delta_table.alias("target").merge(
+            df_final.alias("source"),
+            "target.BaseInteractionGroup_Id = source.BaseInteractionGroup_Id AND target.InteractionGroup_Id = source.InteractionGroup_Id"
+        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        logger.info(f"T2 completed: Data written to {target_fqn}")
+
+    except Exception as e:
+        logger.exception(f"Error in mapping execution: {e}")
+        raise
+
+
+from pyspark.sql import functions as F
+from pyspark.sql.utils import AnalysisException
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("m_3202_wk_loadflag_baseinteractiongroup")
+
+# Configuration
+CATALOG = "BaseInteractionGroup"
+WORK_SCHEMA = "Work"
+FND_SCHEMA = "Foundation"
+PARAMS = {
+    "$$interaction_work_db": f"{CATALOG}.{WORK_SCHEMA}",
+    "$$interaction_fnd_db": f"{CATALOG}.{FND_SCHEMA}",
+    "$$interaction_support_work_db": f"{CATALOG}.{WORK_SCHEMA}"
+}
+
+BIG_END = F.lit('3500-01-01')
+DEC_BIG_END = F.lit(999999999999999999)
+
+def run_m_3202_wk_loadflag_baseinteractiongroup():
+    try:
+        # T1 — SQ_SAF_BaseInteractiongroup (Source Qualifier with SQL override)
+        logger.info("Executing T1: SQ_SAF_BaseInteractiongroup")
+        sql_query = f"""
+        SELECT 
+            ROW_NUMBER() OVER (PARTITION BY SAF.InteractionGroup_Id, Found_Hybrid_Key_Match ORDER BY SAF.SequenceStart_It, SAF.LoadEvent_Id ASC) AS ROW_NUM,
+            CASE WHEN FND.InteractionGroup_Id IS NULL THEN 'N' ELSE 'Y' END AS Found_Hybrid_Key_Match,
+            SAF.BaseInteractionGroup_Id, 
+            SAF.InteractionGroup_Id, 
+            SAF.Effective_Dt, 
+            SAF.Expiration_Dt, 
+            SAF.Transaction_Ts, 
+            SAF.Revision_Ts, 
+            SAF.SequenceStart_It, 
+            SAF.SequenceEnd_It, 
+            SAF.Source_Cd, 
+            SAF.Chksum_BaseInteractionGroup, 
+            SAF.LoadFlag_BaseInteractionGroup 
+        FROM
+            {PARAMS["$$interaction_work_db"]}.SAF_BaseInteractionGroup SAF 
+        LEFT OUTER JOIN
+            {PARAMS["$$interaction_fnd_db"]}.BaseInteractionGroup FND
+        ON 
+            SAF.InteractionGroup_Id = FND.InteractionGroup_Id 
+            AND SAF.Source_Cd = FND.Source_Cd
+            AND SAF.SequenceStart_It = FND.SequenceStart_It
+        """
+        df_saf_baseinteractiongroup = spark.sql(sql_query)
+        df_saf_baseinteractiongroup.createOrReplaceTempView("SQ_SAF_BaseInteractiongroup")
+        logger.info(f"T1 row count: {df_saf_baseinteractiongroup.count()}")
+        logger.info(f"T1 schema: {df_saf_baseinteractiongroup.printSchema()}")
+        df_saf_baseinteractiongroup.show(5, truncate=False)
+
+        # T2 — fil_match_at_point_in_time (Filter transformation)
+        logger.info("Executing T2: fil_match_at_point_in_time")
+        df_filtered = df_saf_baseinteractiongroup.filter(
+            (F.col("SequenceStart_It") >= F.col("fndSequenceStart_It")) &
+            (F.col("SequenceStart_It") < F.col("fndSequenceEnd_It")) |
+            (
+                F.col("fndEffective_Dt").isNull() &
+                F.col("fndExpiration_Dt").isNull() &
+                F.col("fndRevision_Ts").isNull() &
+                F.col("fndTransaction_Ts").isNull() &
+                F.col("fndSequenceStart_It").isNull() &
+                F.col("fndSequenceEnd_It").isNull()
+            )
+        )
+        df_filtered.createOrReplaceTempView("fil_match_at_point_in_time")
+        logger.info(f"T2 row count: {df_filtered.count()}")
+        logger.info(f"T2 schema: {df_filtered.printSchema()}")
+        df_filtered.show(5, truncate=False)
+
+        # T3 — exp_assign_load_flag (Expression transformation)
+        logger.info("Executing T3: exp_assign_load_flag")
+        df_exp = df_filtered.withColumn(
+            "o_LoadFlag",
+            F.when(F.col("LoadFlag_BaseInteractionGroup") == 'I', 'I')
+            .when(F.col("LoadFlag_BaseInteractionGroup") == 'Y', 'I')
+            .when(F.col("InfaMd5_Nb").isNull(), 'Y')
+            .when(F.col("Found_Hybrid_Key_Match") == 'Y', 'I')
+            .when(F.col("WorkTable_ChkSum") != F.col("InfaMd5_Nb"), 'Y')
+            .when((F.col("WorkTable_ChkSum") == F.col("InfaMd5_Nb")) & (F.col("ROW_NUM") != 1), 'Y')
+            .otherwise('N')
+        )
+        df_exp.createOrReplaceTempView("exp_assign_load_flag")
+        logger.info(f"T3 row count: {df_exp.count()}")
+        logger.info(f"T3 schema: {df_exp.printSchema()}")
+        df_exp.show(5, truncate=False)
+
+        # T4 — Write to Target SAF_Baseinteractiongroup
+        logger.info("Executing T4: Write to Target SAF_Baseinteractiongroup")
+        target_fqn = f"{CATALOG}.{WORK_SCHEMA}.SAF_BaseInteractionGroup"
+        target_cols = [
+            "BaseInteractionGroup_Id", "InteractionGroup_Id", "InteractionGroupKey_Cd",
+            "InteractionGroupBusinessKey_Id", "InteractionGroupBusinessKey_Cd", "InteractionGrpLogiclBusnKey_Id",
+            "InteractionGrpLogiclBusnKey_Cd", "InteractionThread_Id", "InteractionThreadKey_Cd", "PartyKey_Cd",
+            "AgentOfRecord_Nb", "AgentOfRecord_Nm", "AgentOfRecordSource_Cd", "AgentOfRecordPhone_Nb",
+            "AlternateTelephone_Nb", "AnalyticHousehold_Nb", "AnalyticParty_Nb", "BestContactTime_Cd",
+            "BestContactTime_Tp", "BillingAccount_Nb", "BusinessName_Ds", "CallBack_Ts", "CommercialPGIndustry_Ds",
+            "CommercialPGOtherIndustry_Ds", "CommercialPGYearsInBusiness_Ds", "CommercialPGCurrentInsured_Cd",
+            "CommercialPGCurrentInsured_Tp", "CommercialPGOtherProducts_Ds", "ContactPrefix_Nm", "ContactFirst_Nm",
+            "ContactMiddle_Nm", "ContactLast_Nm", "ContactFull_Nm", "ContactSuffix_Nm", "EmailAddress_Nm",
+            "EnterpriseCustomer_Nb", "ECIFContact_Nb", "FullPolicy_Nb", "FullTermPremium_Am", "InteractionProduct_Cd",
+            "InteractionProduct_Tp", "Language_Ds", "OperationalHousehold_Nb", "PartyLifecycleStatus_Cd",
+            "PartyLifecycleStatus_Tp", "PolicyEffective_Dt", "PolicyPremiumChange_Am", "PolicyPremiumChange_Pc",
+            "PolicyProcessingPlatform_Nm", "PolicyRenewal_Dt", "PolicyRenewalPremium_Am", "PolicyType_Cd",
+            "PolicyType_Tp", "PreferredTelephone_Nb", "Quote_Nb", "QuoteEvent_Nb", "QuotePlatform_Nm", "RatedState_Cd",
+            "RatedState_Tp", "TimeZone_Cd", "Zip_Cd", "Effective_Dt", "Expiration_Dt", "Transaction_Ts", "Revision_Ts",
+            "SequenceStart_It", "SequenceEnd_It", "Source_Cd", "LoadEvent_Id", "Chksum_BaseInteractionGroup",
+            "LoadFlag_BaseInteractionGroup", "AgencyOfRecord_Nb", "HouseholdBusinessKey_Id", "HouseholdBusinessKey_Cd",
+            "ActivePnCPolicyOwner_Cd", "ActivePnCPolicyOwner_Tp", "CallEligibility_Cd", "CallEligibility_Tp",
+            "ContactBirth_Dt", "ContactGender_Cd", "ContactGender_Tp", "ContactPermitted_Cd", "ContactPermitted_Tp",
+            "ContactSmokerStatus_Cd", "ContactSmokerStatus_Tp", "InteractionAddlProduct_Ds", "InteractionAuto_Cd",
+            "InteractionAuto_Tp", "InteractionBusinessAuto_Cd", "InteractionBusinessAuto_Tp", "InteractionBusinessLiab_Cd",
+            "InteractionBusinessLiab_Tp", "InteractionBusinessProperty_Cd", "InteractionBusinessProperty_Tp",
+            "InteractionCondominium_Cd", "InteractionCondominium_TP", "InteractionHomeowners_Cd", "InteractionHomeowners_Tp",
+            "InteractionIDTheft_Cd", "InteractionIDTheft_Tp", "InteractionLifeEvent_Ds", "InteractionMotorcycle_Cd",
+            "InteractionMotorcycle_Tp", "InteractionRenters_Cd", "InteractionRenters_Tp", "LapseInCoverage_Cd",
+            "LapseInCoverage_Tp", "PriorCarrier_Nm", "QuoteLifeCycleStatus_Cd", "QuoteLifeCycleStatus_Tp", "Opportunity_Nb",
+            "OpportunityDetail_Nb", "Insert_Ts", "AgencyOfRecord_Nm", "TargetKeyLevel_Cd", "TargetKeyLevel_Tp",
+            "Producer_Nb", "EmailJob_Nm", "EmailFromAddress_Nm", "EmailFrom_Nm", "EmailMultiPart_Cd", "EmailMultiPart_Tp",
+            "EmailJobPreviewURL_Tt", "EmailSendDefExtKey_Tt", "EmailSubjectLine_Tt", "EmailCreative_Nb", "WebPreviewURL_Tt",
+            "SourceSubscriber_Nb", "EmailList_Nb", "NationwideAccount_Cd", "NationwideAccount_Tp", "EmailCollateral_Nb",
+            "NWAccountLevel1_Cd", "NWAccountLevel1_Tp", "NWAccountLevel2_Cd", "NWAccountLevel2_Tp", "AnalyticDistrPartner_Id",
+            "DistrPartnerRelationship_Id", "DistrPartnerSalesTerritory_Id", "AgreementRole_Id", "DistrPartner_Nb",
+            "SalesTerritory_Cd"
+        ]
+        df_final = df_exp.select(*target_cols)
+        df_final.write.format("delta").mode("overwrite").saveAsTable(target_fqn)
+        logger.info(f"T4: Data written to target table {target_fqn}")
+
+    except AnalysisException as e:
+        logger.exception(f"AnalysisException occurred: {e}")
+        raise
+    except Exception as e:
+        logger.exception(f"An error occurred: {e}")
+        raise
