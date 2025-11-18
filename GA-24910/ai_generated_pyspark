@@ -1,0 +1,1311 @@
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+from pyspark.sql.utils import AnalysisException
+import logging
+
+# Set up logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("m_3202_wk_loadflag_baseinteractiongroup")
+
+# Configuration
+CATALOG = "SAF_BaseInteractionGroup"
+WORK_SCHEMA = "Work"
+FND_SCHEMA = "Foundation"
+PARAMS = {
+    "$$interaction_work_db": f"{CATALOG}.{WORK_SCHEMA}",
+    "$$interaction_fnd_db": f"{CATALOG}.{FND_SCHEMA}",
+    "$$interaction_support_work_db": f"{CATALOG}.{WORK_SCHEMA}"
+}
+
+BIG_END = F.lit('3500-01-01')
+DEC_BIG_END = F.lit(999999999999999999)
+
+def run_m_3202_wk_loadflag_baseinteractiongroup():
+    try:
+        # T1 — SQ_BaseInteractionGroup
+        logger.info("Processing T1 — SQ_BaseInteractionGroup")
+        df_sq_baseinteractiongroup = spark.table(f"{CATALOG}.{FND_SCHEMA}.BaseInteractionGroup")
+        df_sq_baseinteractiongroup.createOrReplaceTempView("SQ_BaseInteractionGroup")
+        logger.info(f"T1 row count: {df_sq_baseinteractiongroup.count()}, schema: {df_sq_baseinteractiongroup.printSchema()}")
+
+        # T2 — SQ_SAF_BaseInteractiongroup
+        logger.info("Processing T2 — SQ_SAF_BaseInteractiongroup")
+        sql_query_sq_saf = f"""
+            SELECT 
+                ROW_NUMBER() OVER (PARTITION BY SAF.InteractionGroup_Id, Found_Hybrid_Key_Match ORDER BY SAF.SequenceStart_It, SAF.LoadEvent_Id ASC) AS ROW_NUM,
+                CASE WHEN FND.InteractionGroup_Id IS NULL THEN 'N' ELSE 'Y' END AS Found_Hybrid_Key_Match,
+                SAF.BaseInteractionGroup_Id, 
+                SAF.InteractionGroup_Id, 
+                SAF.Effective_Dt, 
+                SAF.Expiration_Dt, 
+                SAF.Transaction_Ts, 
+                SAF.Revision_Ts, 
+                SAF.SequenceStart_It, 
+                SAF.SequenceEnd_It, 
+                SAF.Source_Cd, 
+                SAF.Chksum_BaseInteractionGroup, 
+                SAF.LoadFlag_BaseInteractionGroup
+            FROM
+                {PARAMS['$$interaction_work_db']}.SAF_BaseInteractionGroup SAF 
+            LEFT OUTER JOIN
+                {PARAMS['$$interaction_fnd_db']}.BaseInteractionGroup FND
+            ON 
+                SAF.InteractionGroup_Id = FND.InteractionGroup_Id 
+                AND SAF.Source_Cd = FND.Source_Cd
+                AND SAF.SequenceStart_It = FND.SequenceStart_It
+        """
+        df_sq_saf_baseinteractiongroup = spark.sql(sql_query_sq_saf)
+        df_sq_saf_baseinteractiongroup.createOrReplaceTempView("SQ_SAF_BaseInteractiongroup")
+        logger.info(f"T2 row count: {df_sq_saf_baseinteractiongroup.count()}, schema: {df_sq_saf_baseinteractiongroup.printSchema()}")
+
+        # T3 — jnr_work_to_foundation_for_matches
+        logger.info("Processing T3 — jnr_work_to_foundation_for_matches")
+        df_jnr_work_to_foundation = spark.sql("""
+            SELECT *
+            FROM SQ_BaseInteractionGroup AS master
+            FULL OUTER JOIN SQ_SAF_BaseInteractiongroup AS detail
+            ON master.InteractionGroup_Id = detail.InteractionGroup_Id
+            AND master.Source_Cd = detail.Source_Cd
+        """)
+        df_jnr_work_to_foundation.createOrReplaceTempView("jnr_work_to_foundation_for_matches")
+        logger.info(f"T3 row count: {df_jnr_work_to_foundation.count()}, schema: {df_jnr_work_to_foundation.printSchema()}")
+
+        # T4 — fil_match_at_point_in_time
+        logger.info("Processing T4 — fil_match_at_point_in_time")
+        df_fil_match_at_point_in_time = df_jnr_work_to_foundation.filter(
+            (F.col("SequenceStart_It") >= F.col("fndSequenceStart_It")) &
+            (F.col("SequenceStart_It") < F.col("fndSequenceEnd_It")) |
+            (F.col("fndEffective_Dt").isNull() &
+             F.col("fndExpiration_Dt").isNull() &
+             F.col("fndRevision_Ts").isNull() &
+             F.col("fndTransaction_Ts").isNull() &
+             F.col("fndSequenceStart_It").isNull() &
+             F.col("fndSequenceEnd_It").isNull())
+        )
+        df_fil_match_at_point_in_time.createOrReplaceTempView("fil_match_at_point_in_time")
+        logger.info(f"T4 row count: {df_fil_match_at_point_in_time.count()}, schema: {df_fil_match_at_point_in_time.printSchema()}")
+
+        # T5 — exp_assign_load_flag
+        logger.info("Processing T5 — exp_assign_load_flag")
+        df_exp_assign_load_flag = df_fil_match_at_point_in_time.withColumn(
+            "o_LoadFlag",
+            F.when(F.col("LoadFlag_BaseInteractionGroup") == 'I', 'I')
+            .when(F.col("LoadFlag_BaseInteractionGroup") == 'Y', 'I')
+            .when(F.col("InfaMd5_Nb").isNull(), 'Y')
+            .when(F.col("Found_Hybrid_Key_Match") == 'Y', 'I')
+            .when(F.col("WorkTable_ChkSum") != F.col("InfaMd5_Nb"), 'Y')
+            .when((F.col("WorkTable_ChkSum") == F.col("InfaMd5_Nb")) & (F.col("ROW_NUM") != 1), 'Y')
+            .otherwise('N')
+        )
+        df_exp_assign_load_flag.createOrReplaceTempView("exp_assign_load_flag")
+        logger.info(f"T5 row count: {df_exp_assign_load_flag.count()}, schema: {df_exp_assign_load_flag.printSchema()}")
+
+        # T6 — SAF_Baseinteractiongroup (Target Write)
+        logger.info("Processing T6 — SAF_Baseinteractiongroup")
+        target_fqn = f"{CATALOG}.{WORK_SCHEMA}.SAF_BaseInteractionGroup"
+        target_cols = [
+            "BaseInteractionGroup_Id", "InteractionGroup_Id", "InteractionGroupKey_Cd", "InteractionGroupBusinessKey_Id",
+            "InteractionGroupBusinessKey_Cd", "InteractionGrpLogiclBusnKey_Id", "InteractionGrpLogiclBusnKey_Cd",
+            "InteractionThread_Id", "InteractionThreadKey_Cd", "PartyKey_Cd", "AgentOfRecord_Nb", "AgentOfRecord_Nm",
+            "AgentOfRecordSource_Cd", "AgentOfRecordPhone_Nb", "AlternateTelephone_Nb", "AnalyticHousehold_Nb",
+            "AnalyticParty_Nb", "BestContactTime_Cd", "BestContactTime_Tp", "BillingAccount_Nb", "BusinessName_Ds",
+            "CallBack_Ts", "CommercialPGIndustry_Ds", "CommercialPGOtherIndustry_Ds", "CommercialPGYearsInBusiness_Ds",
+            "CommercialPGCurrentInsured_Cd", "CommercialPGCurrentInsured_Tp", "CommercialPGOtherProducts_Ds",
+            "ContactPrefix_Nm", "ContactFirst_Nm", "ContactMiddle_Nm", "ContactLast_Nm", "ContactFull_Nm",
+            "ContactSuffix_Nm", "EmailAddress_Nm", "EnterpriseCustomer_Nb", "ECIFContact_Nb", "FullPolicy_Nb",
+            "FullTermPremium_Am", "InteractionProduct_Cd", "InteractionProduct_Tp", "Language_Ds",
+            "OperationalHousehold_Nb", "PartyLifecycleStatus_Cd", "PartyLifecycleStatus_Tp", "PolicyEffective_Dt",
+            "PolicyPremiumChange_Am", "PolicyPremiumChange_Pc", "PolicyProcessingPlatform_Nm", "PolicyRenewal_Dt",
+            "PolicyRenewalPremium_Am", "PolicyType_Cd", "PolicyType_Tp", "PreferredTelephone_Nb", "Quote_Nb",
+            "QuoteEvent_Nb", "QuotePlatform_Nm", "RatedState_Cd", "RatedState_Tp", "TimeZone_Cd", "Zip_Cd",
+            "Effective_Dt", "Expiration_Dt", "Transaction_Ts", "Revision_Ts", "SequenceStart_It", "SequenceEnd_It",
+            "Source_Cd", "LoadEvent_Id", "Chksum_BaseInteractionGroup", "LoadFlag_BaseInteractionGroup",
+            "AgencyOfRecord_Nb", "HouseholdBusinessKey_Id", "HouseholdBusinessKey_Cd", "ActivePnCPolicyOwner_Cd",
+            "ActivePnCPolicyOwner_Tp", "CallEligibility_Cd", "CallEligibility_Tp", "ContactBirth_Dt", "ContactGender_Cd",
+            "ContactGender_Tp", "ContactPermitted_Cd", "ContactPermitted_Tp", "ContactSmokerStatus_Cd",
+            "ContactSmokerStatus_Tp", "InteractionAddlProduct_Ds", "InteractionAuto_Cd", "InteractionAuto_Tp",
+            "InteractionBusinessAuto_Cd", "InteractionBusinessAuto_Tp", "InteractionBusinessLiab_Cd",
+            "InteractionBusinessLiab_Tp", "InteractionBusinessProperty_Cd", "InteractionBusinessProperty_Tp",
+            "InteractionCondominium_Cd", "InteractionCondominium_TP", "InteractionHomeowners_Cd",
+            "InteractionHomeowners_Tp", "InteractionIDTheft_Cd", "InteractionIDTheft_Tp", "InteractionLifeEvent_Ds",
+            "InteractionMotorcycle_Cd", "InteractionMotorcycle_Tp", "InteractionRenters_Cd", "InteractionRenters_Tp",
+            "LapseInCoverage_Cd", "LapseInCoverage_Tp", "PriorCarrier_Nm", "QuoteLifeCycleStatus_Cd",
+            "QuoteLifeCycleStatus_Tp", "Opportunity_Nb", "OpportunityDetail_Nb", "Insert_Ts", "AgencyOfRecord_Nm",
+            "TargetKeyLevel_Cd", "TargetKeyLevel_Tp", "Producer_Nb", "EmailJob_Nm", "EmailFromAddress_Nm",
+            "EmailFrom_Nm", "EmailMultiPart_Cd", "EmailMultiPart_Tp", "EmailJobPreviewURL_Tt", "EmailSendDefExtKey_Tt",
+            "EmailSubjectLine_Tt", "EmailCreative_Nb", "WebPreviewURL_Tt", "SourceSubscriber_Nb", "EmailList_Nb",
+            "NationwideAccount_Cd", "NationwideAccount_Tp", "EmailCollateral_Nb", "NWAccountLevel1_Cd",
+            "NWAccountLevel1_Tp", "NWAccountLevel2_Cd", "NWAccountLevel2_Tp", "AnalyticDistrPartner_Id",
+            "DistrPartnerRelationship_Id", "DistrPartnerSalesTerritory_Id", "AgreementRole_Id", "DistrPartner_Nb",
+            "SalesTerritory_Cd"
+        ]
+        df_final = df_exp_assign_load_flag.select(*target_cols)
+        df_final.write.format("delta").mode("overwrite").saveAsTable(target_fqn)
+        logger.info(f"T6 write completed to {target_fqn}")
+
+    except AnalysisException as e:
+        logger.exception(f"AnalysisException occurred: {str(e)}")
+        raise
+    except Exception as e:
+        logger.exception(f"Exception occurred: {str(e)}")
+        raise
+
+
+from pyspark.sql import functions as F
+from pyspark.sql.utils import AnalysisException
+import logging
+
+# Initialize logger
+logger = logging.getLogger("m_3202_saf_wk_baseinteractiongroup")
+logger.setLevel(logging.INFO)
+
+# Configuration
+CATALOG = "SAF_BaseInteractionGroup"
+WORK_SCHEMA = None  # Schema is not provided in the configuration
+FND_SCHEMA = None  # Schema is not provided in the configuration
+PARAMS = {
+    "$$working_dir": "/mnt/data",
+    "$InputFileNameList": "input_file_list.txt"
+}
+BIG_END = F.lit('3500-01-01')
+DEC_BIG_END = F.lit(999999999999999999)
+
+# Helper functions
+def apply_lookup_with_fallback(df, lookup_table, key_col, value_col, default_value):
+    """
+    Perform a left join lookup and fallback to default value if no match is found.
+    """
+    lookup_df = spark.table(lookup_table).select(key_col, value_col)
+    return df.join(lookup_df, df[key_col] == lookup_df[key_col], "left_outer") \
+             .withColumn(value_col, F.coalesce(F.col(value_col), F.lit(default_value)))
+
+def substitute_params(sql_query):
+    """
+    Substitute $$variables in SQL query with PARAMS dictionary values.
+    """
+    for param, value in PARAMS.items():
+        sql_query = sql_query.replace(param, value)
+    return sql_query
+
+def require_cols(df, required_cols):
+    """
+    Ensure required columns exist in the DataFrame.
+    """
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+# Main mapping function
+def run_m_3202_saf_wk_baseinteractiongroup():
+    try:
+        # T1 — SQ_File_SAF_Baseinteractiongroup
+        logger.info("Starting T1: SQ_File_SAF_Baseinteractiongroup")
+        try:
+            df_sq = spark.read.format("csv").option("delimiter", "\004").load(PARAMS["$$working_dir"] + "/" + PARAMS["$InputFileNameList"])
+            df_sq = df_sq.selectExpr(
+                "CAST(LoadEvent_Id AS DECIMAL(18,0)) AS LoadEvent_Id",
+                "CAST(InteractionGroupKey_Cd AS STRING) AS InteractionGroupKey_Cd",
+                "CAST(InteractionGroupBusinessKey_Cd AS STRING) AS InteractionGroupBusinessKey_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(InteractionThreadKey_Cd AS STRING) AS InteractionThreadKey_Cd",
+                "CAST(PartyKey_Cd AS STRING) AS PartyKey_Cd",
+                "CAST(AgentOfRecord_Nb AS STRING) AS AgentOfRecord_Nb",
+                "CAST(AgentOfRecord_Nm AS STRING) AS AgentOfRecord_Nm",
+                "CAST(AgentOfRecordSource_Cd AS STRING) AS AgentOfRecordSource_Cd",
+                "CAST(AgentOfRecordPhone_Nb AS STRING) AS AgentOfRecordPhone_Nb",
+                "CAST(AlternateTelephone_Nb AS STRING) AS AlternateTelephone_Nb",
+                "CAST(BestContactTime_Cd AS STRING) AS BestContactTime_Cd",
+                "CAST(BestContactTimeTranslationRuleTable_Id AS DECIMAL(5,0)) AS BestContactTimeTranslationRuleTable_Id",
+                "CAST(BusinessName_Ds AS STRING) AS BusinessName_Ds",
+                "CAST(CallBack_Ts AS TIMESTAMP) AS CallBack_Ts",
+                "CAST(CommercialPGIndustry_Ds AS STRING) AS CommercialPGIndustry_Ds",
+                "CAST(CommercialPGOtherIndustry_Ds AS STRING) AS CommercialPGOtherIndustry_Ds",
+                "CAST(CommercialPGYearsInBusiness_Ds AS STRING) AS CommercialPGYearsInBusiness_Ds",
+                "CAST(CommercialPGCurrentInsured_Cd AS STRING) AS CommercialPGCurrentInsured_Cd",
+                "CAST(CommercialPGCurrentInsuredTranslationRuleTable_Id AS DECIMAL(5,0)) AS CommercialPGCurrentInsuredTranslationRuleTable_Id",
+                "CAST(CommercialPGOtherProducts_Ds AS STRING) AS CommercialPGOtherProducts_Ds",
+                "CAST(ContactFirst_Nm AS STRING) AS ContactFirst_Nm",
+                "CAST(ContactLast_Nm AS STRING) AS ContactLast_Nm",
+                "CAST(ContactFull_Nm AS STRING) AS ContactFull_Nm",
+                "CAST(EmailAddress_Nm AS STRING) AS EmailAddress_Nm",
+                "CAST(EnterpriseCustomer_Nb AS STRING) AS EnterpriseCustomer_Nb",
+                "CAST(EcifContact_Nb AS STRING) AS EcifContact_Nb",
+                "CAST(FullPolicy_Nb AS STRING) AS FullPolicy_Nb",
+                "CAST(Language_Ds AS STRING) AS Language_Ds",
+                "CAST(OperationalHousehold_Nb AS STRING) AS OperationalHousehold_Nb",
+                "CAST(PartyLifecycleStatus_Cd AS STRING) AS PartyLifecycleStatus_Cd",
+                "CAST(PartyLifecycleStatusTranslationRuleTable_Id AS DECIMAL(5,0)) AS PartyLifecycleStatusTranslationRuleTable_Id",
+                "CAST(PolicyProcessingPlatform_Nm AS STRING) AS PolicyProcessingPlatform_Nm",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_Am",
+                "CAST(PolicyPremiumChange_Pc AS DECIMAL(6,2)) AS PolicyPremiumChange_Pc",
+                "CAST(PolicyRenewal_Dt AS TIMESTAMP) AS PolicyRenewal_Dt",
+                "CAST(PolicyRenewalPremium_Am AS DECIMAL(9,2)) AS PolicyRenewalPremium_Am",
+                "CAST(PolicyType_Cd AS STRING) AS PolicyType_Cd",
+                "CAST(PolicyTypeTranslationRuleTable_Id AS DECIMAL(5,0)) AS PolicyTypeTranslationRuleTable_Id",
+                "CAST(PreferredTelephone_Nb AS STRING) AS PreferredTelephone_Nb",
+                "CAST(Quote_Nb AS STRING) AS Quote_Nb",
+                "CAST(QuoteEvent_Nb AS STRING) AS QuoteEvent_Nb",
+                "CAST(QuotePlatform_Nm AS STRING) AS QuotePlatform_Nm",
+                "CAST(RatedState_Cd AS STRING) AS RatedState_Cd",
+                "CAST(RatedStateTranslationRuleTable_Id AS DECIMAL(5,0)) AS RatedStateTranslationRuleTable_Id",
+                "CAST(TimeZone_Cd AS STRING) AS TimeZone_Cd",
+                "CAST(Zip_Cd AS STRING) AS Zip_Cd",
+                "CAST(Effective_Dt AS TIMESTAMP) AS Effective_Dt",
+                "CAST(Expiration_Dt AS TIMESTAMP) AS Expiration_Dt",
+                "CAST(Transaction_Ts AS TIMESTAMP) AS Transaction_Ts",
+                "CAST(Revision_Ts AS TIMESTAMP) AS Revision_Ts",
+                "CAST(SequenceStart_It AS DECIMAL(18,0)) AS SequenceStart_It",
+                "CAST(SequenceEnd_It AS DECIMAL(18,0)) AS SequenceEnd_It",
+                "CAST(Source_Cd AS STRING) AS Source_Cd",
+                "CAST(InteractionGrpLogiclBusnKey_Cd AS STRING) AS InteractionGrpLogiclBusnKey_Cd",
+                "CAST(AnalyticHousehold_Nb AS STRING) AS AnalyticHousehold_Nb",
+                "CAST(AnalyticParty_Nb AS STRING) AS AnalyticParty_Nb",
+                "CAST(BillingAccount_Nb AS STRING) AS BillingAccount_Nb",
+                "CAST(ContactPrefix_Nm AS STRING) AS ContactPrefix_Nm",
+                "CAST(ContactMiddle_Nm AS STRING) AS ContactMiddle_Nm",
+                "CAST(ContactSuffix_Nm AS STRING) AS ContactSuffix_Nm",
+                "CAST(InteractionProduct_Cd AS STRING) AS InteractionProduct_Cd",
+                "CAST(InteractionProductTranslationRuleTable_Id AS DECIMAL(5,0)) AS InteractionProductTranslationRuleTable_Id",
+                "CAST(PolicyEffective_Dt AS TIMESTAMP) AS PolicyEffective_Dt",
+                "CAST(PolicyPremiumChange_Am AS DECIMAL(9,2)) AS PolicyPremiumChange_
+
+import logging
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("m_3202_wk_fnd_baseinteractiongroup")
+
+# Configuration
+CATALOG = "SAF_BaseInteractionGroup"
+WORK_SCHEMA = "work"
+FND_SCHEMA = "fnd"
+PARAMS = {
+    "$$interaction_work_db": f"{CATALOG}.{WORK_SCHEMA}",
+    "$$interaction_support_work_db": f"{CATALOG}.{WORK_SCHEMA}",
+    "$$load_event_id": "LoadEvent_Id"
+}
+
+BIG_END = F.lit('3500-01-01')
+DEC_BIG_END = F.lit(999999999999999999)
+
+def run_m_3202_wk_fnd_baseinteractiongroup():
+    try:
+        # T1 — SQ_SAF_BaseInteractiongroup_for_get_min_date
+        logger.info("Executing T1: SQ_SAF_BaseInteractiongroup_for_get_min_date")
+        sql_query_t1 = f"""
+        SELECT
+            InteractionGroup_Id,
+            MAX(KeepSequence_It) OVER (PARTITION BY InteractionGroup_Id ORDER BY SequenceStart_It, LoadEvent_Id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS KeepSequence_It,
+            Effective_Dt,
+            MAX(KeepLoadEvent_It) OVER (PARTITION BY InteractionGroup_Id ORDER BY SequenceStart_It, LoadEvent_Id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS KeepLoadEvent_It
+        FROM (
+            SELECT
+                InteractionGroup_Id,
+                SequenceStart_It,
+                Effective_Dt,
+                Rank_It,
+                LoadEvent_Id,
+                COALESCE(Rank_It - SUM(Rank_It) OVER (PARTITION BY InteractionGroup_Id ORDER BY SequenceStart_It, LoadEvent_Id ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING), Rank_It) AS Rank_Diff,
+                CASE WHEN Rank_Diff <> 0 THEN SequenceStart_It END AS KeepSequence_It,
+                CASE WHEN Rank_Diff <> 0 THEN LoadEvent_Id END AS KeepLoadEvent_It
+            FROM (
+                SELECT
+                    InteractionGroup_Id,
+                    SequenceStart_It,
+                    Effective_Dt,
+                    LoadEvent_Id,
+                    RANK() OVER (PARTITION BY InteractionGroup_Id ORDER BY Chksum_BaseInteractionGroup) AS Rank_It
+                FROM {PARAMS["$$interaction_work_db"]}.saf_baseinteractiongroup
+                WHERE LoadFlag_BaseInteractionGroup <> 'I'
+            ) rankbaseinteractiongroup
+        ) ranksequence
+        """
+        df_t1 = spark.sql(sql_query_t1)
+        df_t1.createOrReplaceTempView("SQ_SAF_BaseInteractiongroup_for_get_min_date")
+        logger.info(f"T1 row count: {df_t1.count()}, schema: {df_t1.printSchema()}")
+        df_t1.show(5, truncate=False)
+
+        # T2 — agg_min_eff_dt_min_loadevent_id
+        logger.info("Executing T2: agg_min_eff_dt_min_loadevent_id")
+        df_t2 = df_t1.groupBy("InteractionGroup_Id", "SequenceStart_It").agg(
+            F.min("Effective_Dt").alias("min_effective_dt"),
+            F.min("LoadEvent_Id").alias("min_LoadEvent_Id")
+        )
+        df_t2.createOrReplaceTempView("agg_min_eff_dt_min_loadevent_id")
+        logger.info(f"T2 row count: {df_t2.count()}, schema: {df_t2.printSchema()}")
+        df_t2.show(5, truncate=False)
+
+        # T3 — SQ_SAF_baseinteractiongroup
+        logger.info("Executing T3: SQ_SAF_baseinteractiongroup")
+        df_t3 = spark.table(f"{CATALOG}.{WORK_SCHEMA}.saf_baseinteractiongroup")
+        df_t3.createOrReplaceTempView("SQ_SAF_baseinteractiongroup")
+        logger.info(f"T3 row count: {df_t3.count()}, schema: {df_t3.printSchema()}")
+        df_t3.show(5, truncate=False)
+
+        # T4 — jnr_dedup_intra_day
+        logger.info("Executing T4: jnr_dedup_intra_day")
+        df_t4 = df_t3.join(
+            df_t2,
+            (df_t3["InteractionGroup_Id"] == df_t2["InteractionGroup_Id"]) &
+            (df_t3["SequenceStart_It"] == df_t2["SequenceStart_It"]) &
+            (df_t3["LoadEvent_Id"] == df_t2["min_LoadEvent_Id"]),
+            "inner"
+        )
+        df_t4.createOrReplaceTempView("jnr_dedup_intra_day")
+        logger.info(f"T4 row count: {df_t4.count()}, schema: {df_t4.printSchema()}")
+        df_t4.show(5, truncate=False)
+
+        # T5 — Fil_LoadFlag
+        logger.info("Executing T5: Fil_LoadFlag")
+        df_t5 = df_t4.filter(df_t4["LoadFlag_BaseInteractionGroup"] == 'Y')
+        df_t5.createOrReplaceTempView("Fil_LoadFlag")
+        logger.info(f"T5 row count: {df_t5.count()}, schema: {df_t5.printSchema()}")
+        df_t5.show(5, truncate=False)
+
+        # T6 — Target Write
+        logger.info("Executing T6: Target Write")
+        target_fqn = f"{CATALOG}.{FND_SCHEMA}.BaseInteractionGroup"
+        target_cols = [
+            "BaseInteractionGroup_Id", "InteractionGroup_Id", "InteractionGroupKey_Cd",
+            "InteractionGroupBusinessKey_Id", "InteractionGroupBusinessKey_Cd",
+            "InteractionGrpLogiclBusnKey_Id", "InteractionGrpLogiclBusnKey_Cd",
+            "InteractionThread_Id", "InteractionThreadKey_Cd", "PartyKey_Cd",
+            "AgentOfRecord_Nb", "AgentOfRecord_Nm", "AgentOfRecordSource_Cd",
+            "AgentOfRecordPhone_Nb", "AlternateTelephone_Nb", "AnalyticHousehold_Nb",
+            "AnalyticParty_Nb", "BestContactTime_Cd", "BestContactTime_Tp",
+            "BillingAccount_Nb", "BusinessName_Ds", "CallBack_Ts", "CommercialPGIndustry_Ds",
+            "CommercialPGOtherIndustry_Ds", "CommercialPGYearsInBusiness_Ds",
+            "CommercialPGCurrentInsured_Cd", "CommercialPGCurrentInsured_Tp",
+            "CommercialPGOtherProducts_Ds", "ContactPrefix_Nm", "ContactFirst_Nm",
+            "ContactMiddle_Nm", "ContactLast_Nm", "ContactFull_Nm", "ContactSuffix_Nm",
+            "EmailAddress_Nm", "EnterpriseCustomer_Nb", "ECIFContact_Nb", "FullPolicy_Nb",
+            "FullTermPremium_Am", "InteractionProduct_Cd", "InteractionProduct_Tp",
+            "Language_Ds", "OperationalHousehold_Nb", "PartyLifecycleStatus_Cd",
+            "PartyLifecycleStatus_Tp", "PolicyEffective_Dt", "PolicyPremiumChange_Am",
+            "PolicyPremiumChange_Pc", "PolicyProcessingPlatform_Nm", "PolicyRenewal_Dt",
+            "PolicyRenewalPremium_Am", "PolicyType_Cd", "PolicyType_Tp",
+            "PreferredTelephone_Nb", "Quote_Nb", "QuoteEvent_Nb", "QuotePlatform_Nm",
+            "RatedState_Cd", "RatedState_Tp", "TimeZone_Cd", "Zip_Cd", "Effective_Dt",
+            "Expiration_Dt", "Transaction_Ts", "Revision_Ts", "SequenceStart_It",
+            "SequenceEnd_It", "Source_Cd", "LoadEvent_Id", "InfaMd5_Nb",
+            "AgencyOfRecord_Nb", "HouseholdBusinessKey_Id", "HouseholdBusinessKey_Cd",
+            "ActivePnCPolicyOwner_Cd", "ActivePnCPolicyOwner_Tp", "CallEligibility_Cd",
+            "CallEligibility_Tp", "ContactBirth_Dt", "ContactGender_Cd", "ContactGender_Tp",
+            "ContactPermitted_Cd", "ContactPermitted_Tp", "ContactSmokerStatus_Cd",
+            "ContactSmokerStatus_Tp", "InteractionAddlProduct_Ds", "InteractionAuto_Cd",
+            "InteractionAuto_Tp", "InteractionBusinessAuto_Cd", "InteractionBusinessAuto_Tp",
+            "InteractionBusinessLiab_Cd", "InteractionBusinessLiab_Tp",
+            "InteractionBusinessProperty_Cd", "InteractionBusinessProperty_Tp",
+            "InteractionCondominium_Cd", "InteractionCondominium_TP",
+            "InteractionHomeowners_Cd", "InteractionHomeowners_Tp", "InteractionIDTheft_Cd",
+            "InteractionIDTheft_Tp", "InteractionLifeEvent_Ds", "InteractionMotorcycle_Cd",
+            "InteractionMotorcycle_Tp", "InteractionRenters_Cd", "InteractionRenters_Tp",
+            "LapseInCoverage_Cd", "LapseInCoverage_Tp", "PriorCarrier_Nm",
+            "QuoteLifeCycleStatus_Cd", "QuoteLifeCycleStatus_Tp", "Opportunity_Nb",
+            "OpportunityDetail_Nb", "AgencyOfRecord_Nm", "TargetKeyLevel_Cd",
+            "TargetKeyLevel_Tp", "AnalyticDistrPartner_Id", "DistrPartnerRelationship_Id",
+            "DistrPartnerSalesTerritory_Id", "AgreementRole_Id", "DistrPartner_Nb",
+            "SalesTerritory_Cd"
+        ]
+        df_final = df_t5.select(*target_cols)
+        if DeltaTable.isDeltaTable(spark, target_fqn):
+            delta_table = DeltaTable.forName(spark, target_fqn)
+            delta_table.alias("target").merge(
+                df_final.alias("source"),
+                "target.BaseInteractionGroup_Id = source.BaseInteractionGroup_Id"
+            ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        else:
+            df_final.write.format("delta").mode("overwrite").saveAsTable(target_fqn)
+        logger.info(f"Target write completed: {target_fqn}")
+
+    except Exception as e:
+        logger.exception("Error occurred during mapping execution")
+        raise
+
+
+from pyspark.sql import functions as F
+from pyspark.sql.utils import AnalysisException
+import logging
+
+# Initialize logger
+logger = logging.getLogger("m_3202_dt_chn_baseinteractiongroup")
+logger.setLevel(logging.INFO)
+
+# Configuration
+CATALOG = "SAF_BaseInteractionGroup"
+WORK_SCHEMA = "interaction_work_db"
+FND_SCHEMA = "interaction_fnd_db"
+PARAMS = {
+    "$$interaction_work_db": f"{CATALOG}.{WORK_SCHEMA}",
+    "$$interaction_fnd_db": f"{CATALOG}.{FND_SCHEMA}"
+}
+BIG_END = F.lit('3500-01-01')
+DEC_BIG_END = F.lit(350036535003659999)
+
+def run_m_3202_dt_chn_baseinteractiongroup():
+    """
+    Executes the mapping logic for m_3202_dt_chn_baseinteractiongroup.
+    """
+
+    try:
+        # T1 — SAF_BaseInteractionGroup source definition
+        logger.info("Loading source table SAF_BaseInteractionGroup...")
+        df_saf_baseinteractiongroup = spark.table(f"{CATALOG}.{WORK_SCHEMA}.SAF_BaseInteractionGroup")
+        logger.info(f"SAF_BaseInteractionGroup row count: {df_saf_baseinteractiongroup.count()}")
+        logger.info(f"SAF_BaseInteractionGroup schema: {df_saf_baseinteractiongroup.printSchema()}")
+        df_saf_baseinteractiongroup.createOrReplaceTempView("SAF_BaseInteractionGroup")
+
+        # T2 — SQ_Override_DateChain with SQL override
+        logger.info("Executing SQL override for SQ_Override_DateChain...")
+        sql_query = f"""
+        SELECT
+            O.BaseInteractionGroup_Id,
+            O.InteractionGroup_Id,
+            O.Source_Cd,
+            O.NewExpiration_Dt,
+            O.NewRevision_Ts,
+            O.NewSequenceEnd_It
+        FROM (
+            SELECT
+                BaseInteractionGroup_Id,
+                InteractionGroup_Id,
+                Source_Cd,
+                COALESCE(
+                    MIN(Effective_Dt) OVER (
+                        PARTITION BY InteractionGroup_Id
+                        ORDER BY Effective_Dt ASC, SequenceStart_It ASC
+                        ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+                    ),
+                    DATE '3500-01-01'
+                ) AS NewExpiration_Dt,
+                COALESCE(
+                    MIN(Transaction_Ts) OVER (
+                        PARTITION BY InteractionGroup_Id
+                        ORDER BY Transaction_Ts ASC, SequenceStart_It ASC
+                        ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+                    ),
+                    TIMESTAMP '3500-01-01 00:00:00.000000'
+                ) AS NewRevision_Ts,
+                COALESCE(
+                    MIN(SequenceStart_It) OVER (
+                        PARTITION BY InteractionGroup_Id
+                        ORDER BY SequenceStart_It ASC
+                        ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING
+                    ),
+                    350036535003659999
+                ) AS NewSequenceEnd_It
+            FROM {PARAMS['$$interaction_fnd_db']}.BaseInteractionGroup tgt
+            WHERE EXISTS (
+                SELECT 1
+                FROM {PARAMS['$$interaction_work_db']}.SAF_BaseInteractionGroup tgt1
+                WHERE tgt.InteractionGroup_Id = tgt1.InteractionGroup_Id
+                  AND tgt.Source_Cd = tgt1.Source_Cd
+            )
+            QUALIFY NOT (
+                Expiration_Dt = NewExpiration_Dt
+                AND Revision_Ts = NewRevision_Ts
+                AND SequenceEnd_It = NewSequenceEnd_It
+            )
+        ) O
+        """
+        df_sq_override_datechain = spark.sql(sql_query)
+        logger.info(f"SQ_Override_DateChain row count: {df_sq_override_datechain.count()}")
+        logger.info(f"SQ_Override_DateChain schema: {df_sq_override_datechain.printSchema()}")
+        df_sq_override_datechain.createOrReplaceTempView("SQ_Override_DateChain")
+
+        # T3 — Target write to BaseInteractionGroup
+        logger.info("Writing to target table BaseInteractionGroup...")
+        target_fqn = f"{CATALOG}.{FND_SCHEMA}.BaseInteractionGroup"
+        target_cols = [
+            "BaseInteractionGroup_Id", "InteractionGroup_Id", "Source_Cd",
+            "NewExpiration_Dt", "NewRevision_Ts", "NewSequenceEnd_It"
+        ]
+        df_final = df_sq_override_datechain.select(*target_cols)
+
+        # Validate required columns
+        missing_cols = [col for col in target_cols if col not in df_final.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns in final DataFrame: {missing_cols}")
+
+        # Write to Delta table
+        try:
+            df_final.write.format("delta").mode("overwrite").saveAsTable(target_fqn)
+            logger.info(f"Successfully wrote to target table {target_fqn}.")
+        except AnalysisException as e:
+            logger.exception(f"Error writing to target table {target_fqn}: {str(e)}")
+            raise
+
+    except Exception as e:
+        logger.exception(f"Error in mapping execution: {str(e)}")
+        raise
