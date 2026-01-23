@@ -1,0 +1,1364 @@
+"""
+ETL Pipeline: Group Health Migration
+Migrated from IICS mapping: Group Health Migration
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from typing import Dict
+import logging
+import os
+import uuid
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment
+    
+    Args:
+        table_name: Full table name in format "catalog.database.table" (e.g., "catalog.database.table")
+        local_file_path: Local CSV file path for non-Databricks environment (e.g., r"path/to/file.csv")
+    
+    Returns:
+        DataFrame from catalog or local file
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+    
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging
+    
+    Args:
+        df: DataFrame to log
+        step_name: Description of the step
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class GroupHealthMigration:
+    """
+    ETL Pipeline for Group Health Migration
+    
+    Sources: SRC_GROUP_PLAN
+    Targets: DIM_GROUP, DIM_PLAN
+    Transformation Logic: Generate surrogate keys, translate group size, lookup plan IDs, and standardize plan names.
+    """
+    
+    def __init__(self, spark: SparkSession, config: Dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+    
+    def _configure_spark(self):
+        """
+        Set Spark configurations for optimal performance
+        """
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+        
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+    
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source
+        
+        Optimizations:
+        - Predicate pushdown for filters
+        - Column pruning to select only required fields
+        """
+        logger.info("Starting data extraction")
+        
+        table_name = self.config.get('source_table', 'catalog.database.SRC_GROUP_PLAN')
+        local_file_path = self.config.get('source_local_path', None)
+        
+        df = read_table(
+            table_name=table_name,
+            local_file_path=local_file_path
+        )
+        
+        log_df_info(df, "Source: SRC_GROUP_PLAN")
+        
+        # Select only required columns
+        required_columns = ['GRP_ID', 'GRP_TYPE', 'PLAN_CD', 'PLAN_DESC']
+        df = df.select(*required_columns)
+        
+        logger.info("Data extraction complete")
+        return df
+    
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply business transformations
+        """
+        logger.info("Applying transformations")
+        
+        # Step 1: Generate Group Key
+        df = self._generate_group_key(df)
+        
+        # Step 2: Translate Group Size
+        df = self._translate_group_size(df)
+        
+        # Step 3: Lookup Plan ID
+        df = self._lookup_plan_id(df)
+        
+        # Step 4: Standardize Plan Name
+        df = self._standardize_plan_name(df)
+        
+        log_df_info(df, "After transformations")
+        return df
+    
+    def _generate_group_key(self, df: DataFrame) -> DataFrame:
+        """
+        Generate a unique surrogate key for each group record
+        """
+        logger.info("Generating group keys")
+        return df.withColumn("GROUP_KEY", F.lit(str(uuid.uuid4())))
+    
+    def _translate_group_size(self, df: DataFrame) -> DataFrame:
+        """
+        Translate group type codes into standardized classifications
+        """
+        logger.info("Translating group size")
+        return df.withColumn(
+            "GROUP_SIZE",
+            F.when(F.col("GRP_TYPE") == "SG", "SMALL")
+            .when(F.col("GRP_TYPE") == "LG", "LARGE")
+            .otherwise(None)
+        )
+    
+    def _lookup_plan_id(self, df: DataFrame) -> DataFrame:
+        """
+        Perform lookup to retrieve canonical plan identifier
+        """
+        logger.info("Performing plan ID lookup")
+        
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.PLAN_MAPPING_REF')
+        lookup_local_path = self.config.get('lookup_local_path', None)
+        
+        lookup_df = read_table(
+            table_name=lookup_table_name,
+            local_file_path=lookup_local_path
+        )
+        
+        return df.join(
+            F.broadcast(lookup_df.select("PLAN_CD", "PLAN_ID")),
+            df.PLAN_CD == lookup_df.PLAN_CD,
+            "left"
+        ).drop(lookup_df.PLAN_CD)
+    
+    def _standardize_plan_name(self, df: DataFrame) -> DataFrame:
+        """
+        Standardize free-text plan descriptions
+        """
+        logger.info("Standardizing plan names")
+        return df.withColumn(
+            "PLAN_NAME",
+            F.trim(F.col("PLAN_DESC"))
+        )
+    
+    def load(self, df: DataFrame):
+        """
+        Load data to target
+        
+        Optimizations:
+        - Delta Lake for ACID compliance
+        - Partitioning for query performance
+        """
+        logger.info("Starting data load")
+        
+        target_path = self.config.get('target_path', '/path/to/target')
+        
+        log_df_info(df, "Before load")
+        
+        (df.write
+            .format("delta")
+            .mode(self.config.get('write_mode', 'overwrite'))
+            .partitionBy(*self.config.get('partition_columns', []))
+            .option("overwriteSchema", "true")
+            .save(target_path)
+        )
+        
+        logger.info("Data load complete")
+    
+    def execute(self):
+        """
+        Execute the complete ETL pipeline
+        """
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+        
+        try:
+            # Extract
+            source_df = self.extract()
+            
+            # Transform
+            transformed_df = self.transform(source_df)
+            
+            # Load
+            self.load(transformed_df)
+            
+            logger.info("ETL pipeline completed successfully")
+            
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+# Configuration
+config = {
+    # Source configuration
+    'source_table': 'catalog.database.SRC_GROUP_PLAN',
+    'source_local_path': r'path/to/SRC_GROUP_PLAN.csv',
+    
+    # Target configuration
+    'target_path': '/path/to/target',
+    'write_mode': 'overwrite',
+    'partition_columns': ['GROUP_SIZE'],
+    
+    # Lookup configuration
+    'lookup_table': 'catalog.database.PLAN_MAPPING_REF',
+    'lookup_local_path': r'path/to/PLAN_MAPPING_REF.csv',
+    
+    # Performance configuration
+    'shuffle_partitions': 200
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("GroupHealthMigration").getOrCreate()
+    pipeline = GroupHealthMigration(spark, config)
+    pipeline.execute()
+
+"""
+ETL Pipeline: Group Health Migration
+Migrated from IICS mapping: Group Health Migration
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from typing import Dict
+import logging
+import os
+import uuid
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment
+    
+    Args:
+        table_name: Full table name in format "catalog.database.table" (e.g., "catalog.database.src_member")
+        local_file_path: Local CSV file path for non-Databricks environment (e.g., r"path/to/src_member.csv")
+    
+    Returns:
+        DataFrame from catalog or local file
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+    
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging
+    
+    Args:
+        df: DataFrame to log
+        step_name: Description of the step
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class GroupHealthMigration:
+    """
+    ETL Pipeline for Group Health Migration
+    
+    Sources: SRC_MEMBER
+    Targets: DIM_PERSON
+    Transformation Logic: Extract, transform, and load data with surrogate key generation and domain translation
+    """
+    
+    def __init__(self, spark: SparkSession, config: Dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+    
+    def _configure_spark(self):
+        """
+        Set Spark configurations for optimal performance
+        """
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+        
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+    
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source
+        
+        IICS Source Qualifier equivalent
+        """
+        logger.info("Starting data extraction")
+        
+        table_name = self.config.get('source_table', 'catalog.database.src_member')
+        local_file_path = self.config.get('source_local_path', None)
+        
+        df = read_table(
+            table_name=table_name,
+            local_file_path=local_file_path
+        )
+        
+        log_df_info(df, "Source: SRC_MEMBER")
+        logger.info("Data extraction complete")
+        return df
+    
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply business transformations
+        
+        IICS Transformation Logic equivalent
+        """
+        logger.info("Applying transformations")
+        
+        # Generate surrogate key
+        df = self._generate_surrogate_key(df)
+        
+        # Domain translation for relationship
+        df = self._domain_translation(df)
+        
+        log_df_info(df, "After transformations")
+        return df
+    
+    def _generate_surrogate_key(self, df: DataFrame) -> DataFrame:
+        """
+        Generate surrogate key (PERSON_ID) for each record
+        """
+        logger.info("Generating surrogate key")
+        return df.withColumn("PERSON_ID", F.expr("uuid()"))
+    
+    def _domain_translation(self, df: DataFrame) -> DataFrame:
+        """
+        Translate DEP_SEQ values into domain-specific relationship values
+        """
+        logger.info("Performing domain translation for relationship")
+        
+        # Lookup table configuration
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.relationship_ref')
+        lookup_local_path = self.config.get('lookup_local_path', None)
+        
+        lookup_df = read_table(
+            table_name=lookup_table_name,
+            local_file_path=lookup_local_path
+        )
+        
+        # Perform lookup and domain translation
+        lookup_df = lookup_df.select("DEP_SEQ", "RELATIONSHIP")
+        df = df.join(
+            F.broadcast(lookup_df),
+            df.DEP_SEQ == lookup_df.DEP_SEQ,
+            "left"
+        ).withColumn(
+            "RELATIONSHIP",
+            F.when(F.col("DEP_SEQ") == 0, "SUBSCRIBER")
+            .when(F.col("DEP_SEQ") == 1, "SPOUSE")
+            .when(F.col("DEP_SEQ") >= 2, "CHILD")
+            .otherwise("UNKNOWN")
+        ).drop("DEP_SEQ")
+        
+        return df
+    
+    def load(self, df: DataFrame):
+        """
+        Load data to target
+        
+        IICS Target equivalent
+        """
+        logger.info("Starting data load")
+        
+        target_path = self.config.get('target_path', 'path/to/dim_person')
+        
+        log_df_info(df, "Before load")
+        
+        (df.write
+            .format("delta")
+            .mode(self.config.get('write_mode', 'overwrite'))
+            .option("overwriteSchema", "true")
+            .save(target_path)
+        )
+        
+        logger.info("Data load complete")
+    
+    def execute(self):
+        """
+        Execute the complete ETL pipeline
+        """
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+        
+        try:
+            # Extract
+            source_df = self.extract()
+            
+            # Transform
+            transformed_df = self.transform(source_df)
+            
+            # Load
+            self.load(transformed_df)
+            
+            logger.info("ETL pipeline completed successfully")
+            
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+# Configuration
+config = {
+    # Source configuration
+    'source_table': 'catalog.database.src_member',
+    'source_local_path': r'path/to/src_member.csv',
+    
+    # Target configuration
+    'target_path': '/path/to/dim_person',
+    'write_mode': 'overwrite',
+    
+    # Lookup configuration
+    'lookup_table': 'catalog.database.relationship_ref',
+    'lookup_local_path': r'path/to/relationship_ref.csv',
+    
+    # Performance configuration
+    'shuffle_partitions': 200
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("GroupHealthMigration").getOrCreate()
+    pipeline = GroupHealthMigration(spark, config)
+    pipeline.execute()
+
+"""
+ETL Pipeline: Group Health Migration
+Migrated from IICS mapping: Group Health Migration
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from typing import Dict
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment
+    
+    Args:
+        table_name: Full table name in format "catalog.database.table"
+        local_file_path: Local CSV file path for non-Databricks environment
+    
+    Returns:
+        DataFrame from catalog or local file
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging
+    
+    Args:
+        df: DataFrame to log
+        step_name: Description of the step
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class GroupHealthMigration:
+    """
+    ETL Pipeline for Group Health Migration
+    
+    Sources: SRC_ENROLLMENT
+    Targets: FACT_ENROLLMENT, FACT_ELIGIBILITY
+    Transformation Logic: Generate surrogate keys, convert dates, translate coverage levels, and derive eligibility end dates.
+    """
+    
+    def __init__(self, spark: SparkSession, config: Dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+    
+    def _configure_spark(self):
+        """Set Spark configurations for optimal performance"""
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+    
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source
+        
+        Optimizations:
+        - Predicate pushdown for filters
+        - Column pruning to select only required fields
+        """
+        logger.info("Starting data extraction")
+        table_name = self.config.get('source_table', 'catalog.database.table')
+        local_file_path = self.config.get('source_local_path', None)
+        
+        df = read_table(table_name=table_name, local_file_path=local_file_path)
+        log_df_info(df, "Source: SRC_ENROLLMENT")
+        
+        # Select only required columns
+        required_columns = ['ENRL_ID', 'ENRL_START', 'ENRL_END', 'COV_TIER']
+        df = df.select(*required_columns)
+        
+        logger.info("Data extraction complete")
+        return df
+    
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply business transformations
+        """
+        logger.info("Applying transformations")
+        
+        # Step 1: Generate Surrogate Key
+        df = df.withColumn(
+            "ENROLLMENT_ID",
+            F.when(F.col("ENRL_ID").isNotNull(), F.monotonically_increasing_id())
+            .otherwise(F.lit(None))
+        )
+        
+        # Step 2: Convert Coverage Start Date
+        df = df.withColumn(
+            "COVERAGE_START_DT",
+            F.when(F.col("ENRL_START").isNotNull(), F.to_date(F.col("ENRL_START"), "MMDDYYYY"))
+            .otherwise(F.lit(None))
+        )
+        
+        # Step 3: Convert Coverage End Date
+        df = df.withColumn(
+            "COVERAGE_END_DT",
+            F.when(F.col("ENRL_END") == "99991231", F.lit(None))
+            .when(F.col("ENRL_END").isNotNull(), F.to_date(F.col("ENRL_END"), "MMDDYYYY"))
+            .otherwise(F.lit(None))
+        )
+        
+        # Step 4: Translate Coverage Level (Lookup)
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.coverage_ref')
+        lookup_local_path = self.config.get('lookup_local_path', None)
+        lookup_df = read_table(table_name=lookup_table_name, local_file_path=lookup_local_path)
+        
+        df = df.join(
+            F.broadcast(lookup_df.select("TIER_CODE", "COVERAGE_LEVEL")),
+            df.COV_TIER == lookup_df.TIER_CODE,
+            "left"
+        ).drop("TIER_CODE")
+        
+        # Step 5: Derive Eligibility End Date
+        df = df.withColumn(
+            "ELIGIBILITY_END_DT",
+            F.when(F.col("COVERAGE_END_DT") < F.current_date(), F.col("COVERAGE_END_DT"))
+            .otherwise(F.lit(None))
+        )
+        
+        log_df_info(df, "After transformations")
+        return df
+    
+    def load(self, df: DataFrame):
+        """
+        Load data to target
+        
+        Optimizations:
+        - Delta Lake for ACID compliance
+        - Partitioning for query performance
+        """
+        logger.info("Starting data load")
+        target_path = self.config.get('target_path', '/path/to/target')
+        
+        log_df_info(df, "Before load")
+        
+        (df.write
+            .format("delta")
+            .mode(self.config.get('write_mode', 'overwrite'))
+            .partitionBy(*self.config.get('partition_columns', []))
+            .option("overwriteSchema", "true")
+            .save(target_path)
+        )
+        
+        # Optimize target table
+        if self.config.get('optimize_target', True):
+            logger.info("Optimizing target table")
+            zorder_cols = self.config.get('zorder_columns', [])
+            if zorder_cols:
+                self.spark.sql(f"""
+                    OPTIMIZE delta.`{target_path}`
+                    ZORDER BY ({', '.join(zorder_cols)})
+                """)
+        
+        logger.info("Data load complete")
+    
+    def execute(self):
+        """Execute the complete ETL pipeline"""
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+        try:
+            # Extract
+            source_df = self.extract()
+            
+            # Transform
+            transformed_df = self.transform(source_df)
+            
+            # Load
+            self.load(transformed_df)
+            
+            logger.info("ETL pipeline completed successfully")
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+# Configuration
+config = {
+    # Source configuration
+    'source_table': 'catalog.database.src_enrollment',
+    'source_local_path': r'path/to/src_enrollment.csv',
+    
+    # Target configuration
+    'target_path': '/path/to/target',
+    'write_mode': 'overwrite',
+    'partition_columns': ['COVERAGE_START_DT'],
+    'zorder_columns': ['ENROLLMENT_ID', 'COVERAGE_LEVEL'],
+    
+    # Lookup configuration
+    'lookup_table': 'catalog.database.coverage_ref',
+    'lookup_local_path': r'path/to/coverage_ref.csv',
+    
+    # Performance configuration
+    'shuffle_partitions': 200,
+    'optimize_target': True
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("GroupHealthMigration").getOrCreate()
+    pipeline = GroupHealthMigration(spark, config)
+    pipeline.execute()
+
+"""
+ETL Pipeline: Group Health Migration - FACT_BENEFIT
+Migrated from IICS mapping: Group Health Migration - FACT_BENEFIT
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from typing import Dict
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment
+    
+    Args:
+        table_name: Full table name in format "catalog.database.table" (e.g., "catalog.database.src_benefit")
+        local_file_path: Local CSV file path for non-Databricks environment (e.g., r"path/to/src_benefit.csv")
+    
+    Returns:
+        DataFrame from catalog or local file
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+    
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging
+    
+    Args:
+        df: DataFrame to log
+        step_name: Description of the step
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class GroupHealthMigrationFactBenefit:
+    """
+    ETL Pipeline for Group Health Migration - FACT_BENEFIT
+    
+    Sources: SRC_BENEFIT
+    Targets: FACT_BENEFIT
+    Transformation Logic: Parse benefit type, extract deductible amount, and load transformed data into target table.
+    """
+    
+    def __init__(self, spark: SparkSession, config: Dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+    
+    def _configure_spark(self):
+        """
+        Set Spark configurations for optimal performance
+        """
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+        
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+    
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source
+        
+        IICS Source Qualifier equivalent
+        """
+        logger.info("Starting data extraction")
+        
+        table_name = self.config.get('source_table', 'catalog.database.src_benefit')
+        local_file_path = self.config.get('source_local_path', None)
+        
+        df = read_table(
+            table_name=table_name,
+            local_file_path=local_file_path
+        )
+        
+        log_df_info(df, "Source: SRC_BENEFIT")
+        logger.info("Data extraction complete")
+        return df
+    
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply business transformations
+        
+        IICS Transformation Logic equivalent
+        """
+        logger.info("Applying transformations")
+        
+        # STEP 2: Parse Benefit Type
+        df = self._parse_benefit_type(df)
+        
+        # STEP 3: Extract Deductible Amount
+        df = self._extract_deductible_amount(df)
+        
+        log_df_info(df, "After transformations")
+        return df
+    
+    def _parse_benefit_type(self, df: DataFrame) -> DataFrame:
+        """
+        Parse the concatenated BEN_PKG string to extract BENEFIT_TYPE
+        """
+        logger.info("Parsing benefit type")
+        
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.benefit_component_ref')
+        lookup_local_path = self.config.get('lookup_local_path', None)
+        
+        lookup_df = read_table(
+            table_name=lookup_table_name,
+            local_file_path=lookup_local_path
+        )
+        
+        # Perform lookup enrichment
+        enriched_df = df.join(
+            F.broadcast(lookup_df.select("BEN_PKG", "BENEFIT_TYPE")),
+            df.BEN_PKG == lookup_df.BEN_PKG,
+            "left"
+        ).withColumn(
+            "BENEFIT_TYPE",
+            F.when(F.col("BEN_PKG").isNull(), None).otherwise(F.col("BENEFIT_TYPE"))
+        ).drop("BEN_PKG")
+        
+        log_df_info(enriched_df, "After parsing benefit type")
+        return enriched_df
+    
+    def _extract_deductible_amount(self, df: DataFrame) -> DataFrame:
+        """
+        Extract the numeric deductible amount from the DED_AMT field
+        """
+        logger.info("Extracting deductible amount")
+        
+        transformed_df = df.withColumn(
+            "IN_NETWORK_DED",
+            F.when(F.col("DED_AMT").isNull(), None)
+            .when(F.col("DED_AMT").rlike("^[0-9]+(\.[0-9]+)?$"), F.col("DED_AMT").cast("decimal(18,2)"))
+            .otherwise(None)
+        ).drop("DED_AMT")
+        
+        log_df_info(transformed_df, "After extracting deductible amount")
+        return transformed_df
+    
+    def load(self, df: DataFrame):
+        """
+        Load data to target
+        
+        IICS Target equivalent
+        """
+        logger.info("Starting data load")
+        
+        target_path = self.config.get('target_path', 'path/to/fact_benefit')
+        
+        log_df_info(df, "Before load")
+        
+        (df.write
+            .format("delta")
+            .mode(self.config.get('write_mode', 'overwrite'))
+            .option("overwriteSchema", "true")
+            .save(target_path)
+        )
+        
+        # Optimize target table
+        if self.config.get('optimize_target', True):
+            logger.info("Optimizing target table")
+            zorder_cols = self.config.get('zorder_columns', [])
+            if zorder_cols:
+                self.spark.sql(f"""
+                    OPTIMIZE delta.`{target_path}`
+                    ZORDER BY ({', '.join(zorder_cols)})
+                """)
+        
+        logger.info("Data load complete")
+    
+    def execute(self):
+        """
+        Execute the complete ETL pipeline
+        """
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+        
+        try:
+            # Extract
+            source_df = self.extract()
+            
+            # Transform
+            transformed_df = self.transform(source_df)
+            
+            # Load
+            self.load(transformed_df)
+            
+            logger.info("ETL pipeline completed successfully")
+            
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+# Configuration
+config = {
+    # Source configuration
+    'source_table': 'catalog.database.src_benefit',
+    'source_local_path': r'path/to/src_benefit.csv',
+    
+    # Target configuration
+    'target_path': '/path/to/fact_benefit',
+    'write_mode': 'overwrite',
+    'zorder_columns': ['BENEFIT_TYPE', 'IN_NETWORK_DED'],
+    
+    # Lookup configuration
+    'lookup_table': 'catalog.database.benefit_component_ref',
+    'lookup_local_path': r'path/to/benefit_component_ref.csv',
+    
+    # Performance configuration
+    'shuffle_partitions': 200,
+    'optimize_target': True
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("GroupHealthMigrationFactBenefit").getOrCreate()
+    pipeline = GroupHealthMigrationFactBenefit(spark, config)
+    pipeline.execute()
+
+"""
+ETL Pipeline: Group Health Migration - Eligibility Mapping
+Migrated from IICS mapping: Group Health Migration - Eligibility Mapping
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from typing import Dict
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment
+    
+    Args:
+        table_name: Full table name in format "catalog.database.table" (e.g., "EDW_DB.SRC_ELIGIBILITY")
+        local_file_path: Local CSV file path for non-Databricks environment (e.g., r"path/to/src_eligibility.csv")
+    
+    Returns:
+        DataFrame from catalog or local file
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+    
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging
+    
+    Args:
+        df: DataFrame to log
+        step_name: Description of the step
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class EligibilityMappingPipeline:
+    """
+    ETL Pipeline for Group Health Migration - Eligibility Mapping
+    
+    Sources: SRC_ELIGIBILITY
+    Targets: FACT_ELIGIBILITY
+    Transformation Logic: Map eligibility indicators and reasons to meaningful statuses and reasons
+    """
+    
+    def __init__(self, spark: SparkSession, config: Dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+    
+    def _configure_spark(self):
+        """
+        Set Spark configurations for optimal performance
+        """
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+        
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+    
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source
+        
+        IICS Source Qualifier equivalent
+        """
+        logger.info("Starting data extraction")
+        
+        table_name = self.config.get('source_table', 'EDW_DB.SRC_ELIGIBILITY')
+        local_file_path = self.config.get('source_local_path', None)
+        
+        df = read_table(
+            table_name=table_name,
+            local_file_path=local_file_path
+        )
+        
+        log_df_info(df, "Source: SRC_ELIGIBILITY")
+        logger.info("Data extraction complete")
+        return df
+    
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply business transformations
+        
+        IICS Transformation Logic equivalent
+        """
+        logger.info("Applying transformations")
+        
+        # Step 2: Eligibility Status Mapping
+        df = df.withColumn(
+            "ELIGIBILITY_STATUS",
+            F.when(F.col("ELIG_IND") == "Y", "ACTIVE")
+            .otherwise("INACTIVE")
+        )
+        
+        # Step 3: Eligibility Reason Mapping
+        df = df.withColumn(
+            "ELIGIBILITY_REASON",
+            F.when(F.col("ELIG_REASON").isNull(), "SYSTEM_CONVERSION")
+            .otherwise(F.col("ELIG_REASON"))
+        )
+        
+        log_df_info(df, "After transformations")
+        return df
+    
+    def load(self, df: DataFrame):
+        """
+        Load data to target
+        
+        IICS Target equivalent
+        """
+        logger.info("Starting data load")
+        
+        target_path = self.config.get('target_path', '/path/to/FACT_ELIGIBILITY')
+        
+        log_df_info(df, "Before load")
+        
+        (df.write
+            .format("delta")
+            .mode(self.config.get('write_mode', 'overwrite'))
+            .option("overwriteSchema", "true")
+            .save(target_path)
+        )
+        
+        # Optimize target table
+        if self.config.get('optimize_target', True):
+            logger.info("Optimizing target table")
+            zorder_cols = self.config.get('zorder_columns', [])
+            if zorder_cols:
+                self.spark.sql(f"""
+                    OPTIMIZE delta.`{target_path}`
+                    ZORDER BY ({', '.join(zorder_cols)})
+                """)
+        
+        logger.info("Data load complete")
+    
+    def execute(self):
+        """
+        Execute the complete ETL pipeline
+        """
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+        
+        try:
+            # Extract
+            source_df = self.extract()
+            
+            # Transform
+            transformed_df = self.transform(source_df)
+            
+            # Load
+            self.load(transformed_df)
+            
+            logger.info("ETL pipeline completed successfully")
+            
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+# Configuration
+config = {
+    # Source configuration
+    'source_table': 'EDW_DB.SRC_ELIGIBILITY',
+    'source_local_path': r'path/to/src_eligibility.csv',
+    
+    # Target configuration
+    'target_path': '/path/to/FACT_ELIGIBILITY',
+    'write_mode': 'overwrite',
+    'zorder_columns': ['ELIGIBILITY_STATUS', 'ELIGIBILITY_REASON'],
+    
+    # Performance configuration
+    'shuffle_partitions': 200,
+    'optimize_target': True
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("EligibilityMappingPipeline").getOrCreate()
+    pipeline = EligibilityMappingPipeline(spark, config)
+    pipeline.execute()
+
+"""
+ETL Pipeline: Group Health Migration - FACT_CONTRIBUTION
+Migrated from IICS mapping: Group Health Migration - FACT_CONTRIBUTION
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from typing import Dict
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment
+    
+    Args:
+        table_name: Full table name in format "catalog.database.table"
+        local_file_path: Local CSV file path for non-Databricks environment
+    
+    Returns:
+        DataFrame from catalog or local file
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+    
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging
+    
+    Args:
+        df: DataFrame to log
+        step_name: Description of the step
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class GroupHealthMigrationFactContribution:
+    """
+    ETL Pipeline for Group Health Migration - FACT_CONTRIBUTION
+    
+    Sources: SRC_RATING
+    Targets: FACT_CONTRIBUTION
+    Transformation Logic: Extract, transform, and load contribution data
+    """
+    
+    def __init__(self, spark: SparkSession, config: Dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+    
+    def _configure_spark(self):
+        """
+        Set Spark configurations for optimal performance
+        """
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+        
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+    
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source
+        
+        IICS Source Qualifier equivalent
+        """
+        logger.info("Starting data extraction")
+        
+        table_name = self.config.get('source_table', 'catalog.database.table')
+        local_file_path = self.config.get('source_local_path', None)
+        
+        df = read_table(
+            table_name=table_name,
+            local_file_path=local_file_path
+        )
+        
+        log_df_info(df, "Source: SRC_RATING")
+        logger.info("Data extraction complete")
+        return df
+    
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply business transformations
+        
+        IICS Transformation Logic equivalent
+        """
+        logger.info("Applying transformations")
+        
+        # Employer Contribution Percentage Transformation
+        df = df.withColumn(
+            "EMPLOYER_CONTRIB_PCT",
+            F.when(F.col("ER_CONTRIB").isNotNull(),
+                   (F.regexp_replace(F.col("ER_CONTRIB"), "%", "").cast("decimal(18,2)") / 100))
+            .otherwise(None)
+        )
+        
+        # Employee Contribution Percentage Transformation
+        df = df.withColumn(
+            "EMPLOYEE_CONTRIB_PCT",
+            F.when(F.col("EE_CONTRIB").isNotNull(),
+                   (F.regexp_replace(F.col("EE_CONTRIB"), "%", "").cast("decimal(18,2)") / 100))
+            .otherwise(F.when(F.col("EMPLOYER_CONTRIB_PCT").isNotNull(),
+                              1 - F.col("EMPLOYER_CONTRIB_PCT"))
+                       .otherwise(None))
+        )
+        
+        # Base Rate Transformation
+        df = df.withColumn(
+            "BASE_RATE",
+            F.when(F.col("RATE_AMT").isNotNull(),
+                   F.regexp_replace(F.col("RATE_AMT"), "[^0-9.]", "").cast("decimal(18,2)"))
+            .otherwise(None)
+        )
+        
+        log_df_info(df, "After transformations")
+        return df
+    
+    def load(self, df: DataFrame):
+        """
+        Load data to target
+        
+        IICS Target equivalent
+        """
+        logger.info("Starting data load")
+        
+        target_path = self.config.get('target_path', 'path/to/target')
+        
+        log_df_info(df, "Before load")
+        
+        (df.select("EMPLOYER_CONTRIB_PCT", "EMPLOYEE_CONTRIB_PCT", "BASE_RATE")
+           .write
+           .format("delta")
+           .mode(self.config.get('write_mode', 'overwrite'))
+           .option("overwriteSchema", "true")
+           .save(target_path)
+        )
+        
+        # Optimize target table
+        if self.config.get('optimize_target', True):
+            logger.info("Optimizing target table")
+            zorder_cols = self.config.get('zorder_columns', [])
+            if zorder_cols:
+                self.spark.sql(f"""
+                    OPTIMIZE delta.`{target_path}`
+                    ZORDER BY ({', '.join(zorder_cols)})
+                """)
+        
+        logger.info("Data load complete")
+    
+    def execute(self):
+        """
+        Execute the complete ETL pipeline
+        """
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+        
+        try:
+            # Extract
+            source_df = self.extract()
+            
+            # Transform
+            transformed_df = self.transform(source_df)
+            
+            # Load
+            self.load(transformed_df)
+            
+            logger.info("ETL pipeline completed successfully")
+            
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+# Configuration
+config = {
+    # Source configuration
+    'source_table': 'edw_db.src_rating',  # catalog.database.table
+    'source_local_path': r'path/to/src_rating.csv',
+    
+    # Target configuration
+    'target_path': '/path/to/fact_contribution',
+    'write_mode': 'overwrite',
+    'zorder_columns': ['EMPLOYER_CONTRIB_PCT', 'EMPLOYEE_CONTRIB_PCT'],
+    
+    # Performance configuration
+    'shuffle_partitions': 200,
+    'optimize_target': True
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("GroupHealthMigrationFactContribution").getOrCreate()
+    pipeline = GroupHealthMigrationFactContribution(spark, config)
+    pipeline.execute()
