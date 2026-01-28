@@ -1,0 +1,746 @@
+# ======================================================================
+# ORIGINAL PYSPARK CODE
+# ======================================================================
+
+MAPPING FILE: .txt
+====================================================================================================
+Below is the production-ready PySpark code for the migration of the IICS mapping `CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3`:
+
+
+"""
+ETL Pipeline: CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3
+Migrated from IICS mapping: CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+from typing import Dict
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment.
+
+    Args:
+        table_name: Full table name in format "catalog.database.table".
+        local_file_path: Local CSV file path for non-Databricks environment.
+
+    Returns:
+        DataFrame from catalog or local file.
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging.
+
+    Args:
+        df: DataFrame to log.
+        step_name: Description of the step.
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3:
+    """
+    ETL Pipeline for migrating data from CDH_GW_BUR to W_CLAIM_CD_BUR_SCD3.
+
+    Sources: CDH_GW_BUR
+    Targets: W_CLAIM_CD_BUR_SCD3_I, W_CLAIM_CD_BUR_SCD3_U
+    Transformation Logic: SCD Type 3 with insert/update flags.
+    """
+
+    def __init__(self, spark: SparkSession, config: Dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+
+    def _configure_spark(self):
+        """Set Spark configurations for optimal performance."""
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source table CDH_GW_BUR.
+
+        Returns:
+            Extracted DataFrame.
+        """
+        logger.info("Starting data extraction")
+        table_name = self.config.get('source_table', 'catalog.database.CDH_GW_BUR')
+        local_file_path = self.config.get('source_local_path', None)
+
+        df = read_table(table_name=table_name, local_file_path=local_file_path)
+        log_df_info(df, "Source: CDH_GW_BUR")
+
+        # Apply transformations for source extraction
+        df = df.select(
+            F.col("POLICY_STATE"),
+            F.col("BUR"),
+            F.lit("GWCDH").alias("SOURCE_NAME")
+        )
+        logger.info("Data extraction complete")
+        return df
+
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply transformations to the extracted data.
+
+        Args:
+            df: Extracted DataFrame.
+
+        Returns:
+            Transformed DataFrame.
+        """
+        logger.info("Applying transformations")
+
+        # Step 2: EXP_BUR Transformation
+        df = df.select(
+            F.col("POLICY_STATE").alias("INTEGRATION_ID"),
+            F.col("BUR"),
+            F.col("SOURCE_NAME")
+        )
+
+        # Step 3: Lookup Transformation
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.W_CLAIM_CD_BUR_SCD3')
+        lookup_local_path = self.config.get('lookup_local_path', None)
+        lookup_df = read_table(table_name=lookup_table_name, local_file_path=lookup_local_path)
+
+        lookup_df = lookup_df.select(
+            F.col("ROW_WID").alias("LKP_ROW_WID"),
+            F.col("INTEGRATION_ID").alias("LKP_INTEGRATION_ID"),
+            F.col("NEW_BUR").alias("LKP_NEW_BUR")
+        )
+
+        df = df.join(
+            F.broadcast(lookup_df),
+            df.INTEGRATION_ID == lookup_df.LKP_INTEGRATION_ID,
+            "left"
+        )
+
+        # Step 4: EXP_Flag Transformation
+        df = df.withColumn(
+            "o_Flag",
+            F.when(F.col("LKP_ROW_WID").isNull(), "I")
+            .when(F.md5(F.col("BUR")) == F.md5(F.col("LKP_NEW_BUR")), "NC")
+            .otherwise("U")
+        ).withColumn(
+            "CDM_INSERT_DT", F.current_timestamp()
+        ).withColumn(
+            "CDM_UPDATE_DT", F.current_timestamp()
+        ).withColumn(
+            "TGT_TABLE_NAME", F.lit("W_CLAIM_CD_BUR_SCD3")
+        )
+
+        log_df_info(df, "After transformations")
+        return df
+
+    def load(self, df: DataFrame):
+        """
+        Load data into target tables.
+
+        Args:
+            df: Transformed DataFrame.
+        """
+        logger.info("Starting data load")
+
+        # Step 5: Router Transformation
+        insert_df = df.filter(F.col("o_Flag") == "I").select(
+            F.col("BUR").alias("NEW_BUR"),
+            F.col("LKP_NEW_BUR").alias("OLD_BUR")
+        )
+
+        update_df = df.filter(F.col("o_Flag") == "U").select(
+            F.col("LKP_ROW_WID").alias("ROW_WID")
+        )
+
+        # Step 6: Target Insert
+        insert_path = self.config.get('insert_target_path', '/path/to/W_CLAIM_CD_BUR_SCD3_I')
+        (insert_df.write
+            .format("delta")
+            .mode("append")
+            .save(insert_path)
+        )
+
+        # Step 7: Target Update
+        update_path = self.config.get('update_target_path', '/path/to/W_CLAIM_CD_BUR_SCD3_U')
+        (update_df.write
+            .format("delta")
+            .mode("append")
+            .save(update_path)
+        )
+
+        logger.info("Data load complete")
+
+    def execute(self):
+        """Execute the complete ETL pipeline."""
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+        try:
+            # Extract
+            source_df = self.extract()
+
+            # Transform
+            transformed_df = self.transform(source_df)
+
+            # Load
+            self.load(transformed_df)
+
+            logger.info("ETL pipeline completed successfully")
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+
+# Configuration
+config = {
+    'source_table': 'catalog.database.CDH_GW_BUR',
+    'source_local_path': r'/path/to/CDH_GW_BUR.csv',
+    'lookup_table': 'catalog.database.W_CLAIM_CD_BUR_SCD3',
+    'lookup_local_path': r'/path/to/W_CLAIM_CD_BUR_SCD3.csv',
+    'insert_target_path': '/path/to/W_CLAIM_CD_BUR_SCD3_I',
+    'update_target_path': '/path/to/W_CLAIM_CD_BUR_SCD3_U',
+    'shuffle_partitions': 200
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("ETL_Pipeline_CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3").getOrCreate()
+    pipeline = CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3(spark, config)
+    pipeline.execute()
+
+
+
+# ======================================================================
+# AUTO-GENERATED UNIT TESTS
+# Generated by PySparkUnitTestGenAgent (Chunking Strategy)
+# ======================================================================
+
+# To run: pytest <this_file>.py -v
+
+
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+from pyspark.sql import functions as F
+from chispa.dataframe_comparer import assert_df_equality
+from unittest.mock import Mock, patch, MagicMock, call
+from decimal import Decimal
+
+
+@pytest.fixture(scope="session")
+def spark_session():
+    """Create a SparkSession for testing"""
+    spark = SparkSession.builder \
+        .master("local[1]") \
+        .appName("pytest-pyspark-tests") \
+        .config("spark.driver.host", "localhost") \
+        .config("spark.sql.shuffle.partitions", "1") \
+        .getOrCreate()
+    yield spark
+    spark.stop()
+
+
+# ======================================================================
+# Tests for: Chunk 0 (Lines 1-100)
+# ======================================================================
+
+from delta.tables import DeltaTable
+from etl_pipeline import read_table, log_df_info, CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3
+
+def spark_session():
+    return SparkSession.builder.master("local").appName("pytest").getOrCreate()
+
+@patch("etl_pipeline.os.environ", {"DATABRICKS_RUNTIME_VERSION": "10.4"})
+@patch("etl_pipeline.spark.table")
+def test_read_table_databricks(mock_spark_table, spark_session):
+    """
+    Test read_table function when running in Databricks environment.
+    """
+    mock_spark_table.return_value = spark_session.createDataFrame(
+        [(1, "Alice"), (2, "Bob")],
+        StructType([
+            StructField("id", IntegerType(), True),
+            StructField("name", StringType(), True)
+        ])
+    )
+    result = read_table("catalog.database.table")
+    assert result.count() == 2
+    assert "id" in result.columns
+    assert "name" in result.columns
+
+@patch("etl_pipeline.os.environ", {})
+@patch("etl_pipeline.spark.read.csv")
+def test_read_table_local_file(mock_spark_read_csv, spark_session):
+    """
+    Test read_table function when running in local environment with valid file path.
+    """
+    mock_spark_read_csv.return_value = spark_session.createDataFrame(
+        [(1, "Alice"), (2, "Bob")],
+        StructType([
+            StructField("id", IntegerType(), True),
+            StructField("name", StringType(), True)
+        ])
+    )
+    result = read_table("catalog.database.table", local_file_path="test.csv")
+    assert result.count() == 2
+    assert "id" in result.columns
+    assert "name" in result.columns
+
+@patch("etl_pipeline.os.environ", {})
+def test_read_table_local_file_missing_path(spark_session):
+    """
+    Test read_table function when running in local environment without file path.
+    """
+    with pytest.raises(Exception, match="Local file path required for catalog.database.table"):
+        read_table("catalog.database.table")
+
+def test_log_df_info_valid_dataframe(spark_session, caplog):
+    """
+    Test log_df_info function with a valid DataFrame.
+    """
+    df = spark_session.createDataFrame(
+        [(1, "Alice"), (2, "Bob")],
+        StructType([
+            StructField("id", IntegerType(), True),
+            StructField("name", StringType(), True)
+        ])
+    )
+    log_df_info(df, "Test Step")
+    assert "Test Step: 2 columns" in caplog.text
+    assert "Schema: ['id:IntegerType', 'name:StringType']" in caplog.text
+
+def test_log_df_info_empty_dataframe(spark_session, caplog):
+    """
+    Test log_df_info function with an empty DataFrame.
+    """
+    df = spark_session.createDataFrame([], StructType([]))
+    log_df_info(df, "Empty Step")
+    assert "Empty Step: 0 columns" in caplog.text
+    assert "Schema: []" in caplog.text
+
+def test_CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3_initialization(spark_session):
+    """
+    Test initialization of CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3 class.
+    """
+    config = {"shuffle_partitions": 100}
+    pipeline = CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3(spark_session, config)
+    assert pipeline.spark == spark_session
+    assert pipeline.config == config
+
+def test_CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3_configure_spark(spark_session):
+    """
+    Test _configure_spark method of CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3 class.
+    """
+    config = {"shuffle_partitions": 100}
+    pipeline = CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3(spark_session, config)
+    pipeline._configure_spark()
+    assert spark_session.conf.get("spark.sql.adaptive.enabled") == "true"
+    assert spark_session.conf.get("spark.sql.adaptive.coalescePartitions.enabled") == "true"
+    assert spark_session.conf.get("spark.sql.shuffle.partitions") == "100"
+
+@patch("etl_pipeline.read_table")
+@patch("etl_pipeline.log_df_info")
+def test_CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3_extract(mock_log_df_info, mock_read_table, spark_session):
+    """
+    Test extract method of CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3 class.
+    """
+    mock_read_table.return_value = spark_session.createDataFrame(
+        [(1, "Alice"), (2, "Bob")],
+        StructType([
+            StructField("id", IntegerType(), True),
+            StructField("name", StringType(), True)
+        ])
+    )
+    config = {"source_table": "catalog.database.CDH_GW_BUR"}
+    pipeline = CDH_GW_BUR_TO_W_CLAIM_CD_BUR_SCD3(spark_session, config)
+    result = pipeline.extract()
+    assert result.count() == 2
+    assert "id" in result.columns
+    assert "name" in result.columns
+    mock_log_df_info.assert_called_once_with(result, "Source: CDH_GW_BUR")
+
+# ======================================================================
+# Tests for: Chunk 1 (Lines 81-180)
+# ======================================================================
+
+def spark_session():
+    return SparkSession.builder.master("local").appName("pytest").getOrCreate()
+
+@patch("module_under_test.read_table")
+@patch("module_under_test.log_df_info")
+def test_extract_valid_data(mock_log_df_info, mock_read_table, spark_session):
+    """
+    Test extract method with valid data.
+    """
+    # Mock configuration
+    config = {
+        'source_table': 'catalog.database.CDH_GW_BUR',
+        'source_local_path': None
+    }
+
+    # Mock read_table return value
+    test_data = [("CA", "BUR1"), ("NY", "BUR2")]
+    schema = StructType([
+        StructField("POLICY_STATE", StringType(), True),
+        StructField("BUR", StringType(), True)
+    ])
+    mock_read_table.return_value = spark_session.createDataFrame(test_data, schema)
+
+    # Execute extract method
+    result = module_under_test.extract(config)
+
+    # Expected DataFrame
+    expected_data = [("CA", "BUR1", "GWCDH"), ("NY", "BUR2", "GWCDH")]
+    expected_schema = StructType([
+        StructField("POLICY_STATE", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("SOURCE_NAME", StringType(), True)
+    ])
+    expected_df = spark_session.createDataFrame(expected_data, expected_schema)
+
+    # Validate results
+    assert_df_equality(result, expected_df)
+
+@patch("module_under_test.read_table")
+@patch("module_under_test.log_df_info")
+def test_extract_empty_data(mock_log_df_info, mock_read_table, spark_session):
+    """
+    Test extract method with empty data.
+    """
+    # Mock configuration
+    config = {
+        'source_table': 'catalog.database.CDH_GW_BUR',
+        'source_local_path': None
+    }
+
+    # Mock read_table return value
+    schema = StructType([
+        StructField("POLICY_STATE", StringType(), True),
+        StructField("BUR", StringType(), True)
+    ])
+    mock_read_table.return_value = spark_session.createDataFrame([], schema)
+
+    # Execute extract method
+    result = module_under_test.extract(config)
+
+    # Expected DataFrame
+    expected_df = spark_session.createDataFrame([], schema)
+
+    # Validate results
+    assert_df_equality(result, expected_df)
+
+@patch("module_under_test.read_table")
+@patch("module_under_test.log_df_info")
+def test_transform_valid_data(mock_log_df_info, mock_read_table, spark_session):
+    """
+    Test transform method with valid data.
+    """
+    # Mock configuration
+    config = {
+        'lookup_table': 'catalog.database.W_CLAIM_CD_BUR_SCD3',
+        'lookup_local_path': None
+    }
+
+    # Mock input DataFrame
+    input_data = [("CA", "BUR1", "GWCDH"), ("NY", "BUR2", "GWCDH")]
+    input_schema = StructType([
+        StructField("POLICY_STATE", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("SOURCE_NAME", StringType(), True)
+    ])
+    input_df = spark_session.createDataFrame(input_data, input_schema)
+
+    # Mock lookup DataFrame
+    lookup_data = [("1", "CA", "BUR1"), ("2", "NY", "BUR3")]
+    lookup_schema = StructType([
+        StructField("ROW_WID", StringType(), True),
+        StructField("INTEGRATION_ID", StringType(), True),
+        StructField("NEW_BUR", StringType(), True)
+    ])
+    mock_read_table.return_value = spark_session.createDataFrame(lookup_data, lookup_schema)
+
+    # Execute transform method
+    result = module_under_test.transform(input_df, config)
+
+    # Expected DataFrame
+    expected_data = [
+        ("CA", "BUR1", "GWCDH", "1", "I"),
+        ("NY", "BUR2", "GWCDH", None, "I")
+    ]
+    expected_schema = StructType([
+        StructField("INTEGRATION_ID", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("SOURCE_NAME", StringType(), True),
+        StructField("LKP_ROW_WID", StringType(), True),
+        StructField("o_Flag", StringType(), True)
+    ])
+    expected_df = spark_session.createDataFrame(expected_data, expected_schema)
+
+    # Validate results
+    assert_df_equality(result, expected_df)
+
+@patch("module_under_test.read_table")
+@patch("module_under_test.log_df_info")
+def test_transform_empty_data(mock_log_df_info, mock_read_table, spark_session):
+    """
+    Test transform method with empty data.
+    """
+    # Mock configuration
+    config = {
+        'lookup_table': 'catalog.database.W_CLAIM_CD_BUR_SCD3',
+        'lookup_local_path': None
+    }
+
+    # Mock input DataFrame
+    input_schema = StructType([
+        StructField("POLICY_STATE", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("SOURCE_NAME", StringType(), True)
+    ])
+    input_df = spark_session.createDataFrame([], input_schema)
+
+    # Mock lookup DataFrame
+    lookup_schema = StructType([
+        StructField("ROW_WID", StringType(), True),
+        StructField("INTEGRATION_ID", StringType(), True),
+        StructField("NEW_BUR", StringType(), True)
+    ])
+    mock_read_table.return_value = spark_session.createDataFrame([], lookup_schema)
+
+    # Execute transform method
+    result = module_under_test.transform(input_df, config)
+
+    # Expected DataFrame
+    expected_df = spark_session.createDataFrame([], input_schema)
+
+    # Validate results
+    assert_df_equality(result, expected_df)
+
+@patch("module_under_test.log_df_info")
+def test_load_valid_data(mock_log_df_info, spark_session):
+    """
+    Test load method with valid data.
+    """
+    # Mock input DataFrame
+    input_data = [
+        ("CA", "BUR1", "GWCDH", "1", "I"),
+        ("NY", "BUR2", "GWCDH", None, "U")
+    ]
+    input_schema = StructType([
+        StructField("INTEGRATION_ID", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("SOURCE_NAME", StringType(), True),
+        StructField("LKP_ROW_WID", StringType(), True),
+        StructField("o_Flag", StringType(), True)
+    ])
+    input_df = spark_session.createDataFrame(input_data, input_schema)
+
+    # Mock write operations
+    mock_write = MagicMock()
+    input_df.write.format.return_value = mock_write
+
+    # Execute load method
+    module_under_test.load(input_df)
+
+    # Validate write operations
+    mock_write.save.assert_called()
+
+# ======================================================================
+# Tests for: Chunk 2 (Lines 161-233)
+# ======================================================================
+
+from pyspark.sql import DataFrame
+
+def spark_session():
+    return SparkSession.builder.master("local").appName("pytest").getOrCreate()
+
+@patch("pyspark.sql.DataFrame.write")
+def test_load_insert_data(mock_write, spark_session):
+    """
+    Test the load method for insert data scenario.
+    """
+    # Mock configuration
+    config = {
+        'insert_target_path': '/mock/path/insert',
+        'update_target_path': '/mock/path/update'
+    }
+
+    # Create test data
+    test_data = [("I", "new_bur_1", "old_bur_1"), ("I", "new_bur_2", "old_bur_2")]
+    schema = StructType([
+        StructField("o_Flag", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("LKP_NEW_BUR", StringType(), True)
+    ])
+    df = spark_session.createDataFrame(test_data, schema)
+
+    # Mock write operation
+    mock_write.format.return_value.mode.return_value.save.return_value = None
+
+    # Execute load method
+    pipeline = MagicMock()
+    pipeline.config = config
+    pipeline.load(df)
+
+    # Validate write operation
+    mock_write.format.assert_called_with("delta")
+    mock_write.mode.assert_called_with("append")
+    mock_write.save.assert_called_with('/mock/path/insert')
+
+@patch("pyspark.sql.DataFrame.write")
+def test_load_update_data(mock_write, spark_session):
+    """
+    Test the load method for update data scenario.
+    """
+    # Mock configuration
+    config = {
+        'insert_target_path': '/mock/path/insert',
+        'update_target_path': '/mock/path/update'
+    }
+
+    # Create test data
+    test_data = [("U", "row_wid_1"), ("U", "row_wid_2")]
+    schema = StructType([
+        StructField("o_Flag", StringType(), True),
+        StructField("LKP_ROW_WID", StringType(), True)
+    ])
+    df = spark_session.createDataFrame(test_data, schema)
+
+    # Mock write operation
+    mock_write.format.return_value.mode.return_value.save.return_value = None
+
+    # Execute load method
+    pipeline = MagicMock()
+    pipeline.config = config
+    pipeline.load(df)
+
+    # Validate write operation
+    mock_write.format.assert_called_with("delta")
+    mock_write.mode.assert_called_with("append")
+    mock_write.save.assert_called_with('/mock/path/update')
+
+def test_load_empty_dataframe(spark_session):
+    """
+    Test the load method with an empty DataFrame.
+    """
+    # Mock configuration
+    config = {
+        'insert_target_path': '/mock/path/insert',
+        'update_target_path': '/mock/path/update'
+    }
+
+    # Create empty DataFrame
+    schema = StructType([
+        StructField("o_Flag", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("LKP_NEW_BUR", StringType(), True),
+        StructField("LKP_ROW_WID", StringType(), True)
+    ])
+    df = spark_session.createDataFrame([], schema)
+
+    # Execute load method
+    pipeline = MagicMock()
+    pipeline.config = config
+    pipeline.load(df)
+
+    # Validate no write operations
+    pipeline.load.assert_not_called()
+
+@patch("pyspark.sql.DataFrame.write")
+def test_load_invalid_flag(mock_write, spark_session):
+    """
+    Test the load method with invalid flag values.
+    """
+    # Mock configuration
+    config = {
+        'insert_target_path': '/mock/path/insert',
+        'update_target_path': '/mock/path/update'
+    }
+
+    # Create test data with invalid flag
+    test_data = [("X", "new_bur_1", "old_bur_1"), ("Y", "new_bur_2", "old_bur_2")]
+    schema = StructType([
+        StructField("o_Flag", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("LKP_NEW_BUR", StringType(), True)
+    ])
+    df = spark_session.createDataFrame(test_data, schema)
+
+    # Mock write operation
+    mock_write.format.return_value.mode.return_value.save.return_value = None
+
+    # Execute load method
+    pipeline = MagicMock()
+    pipeline.config = config
+    pipeline.load(df)
+
+    # Validate no write operations for invalid flags
+    mock_write.format.assert_not_called()
+    mock_write.mode.assert_not_called()
+    mock_write.save.assert_not_called()
+
+@patch("pyspark.sql.DataFrame.write")
+def test_load_partial_data(mock_write, spark_session):
+    """
+    Test the load method with partial data (some rows for insert, some for update).
+    """
+    # Mock configuration
+    config = {
+        'insert_target_path': '/mock/path/insert',
+        'update_target_path': '/mock/path/update'
+    }
+
+    # Create test data
+    test_data = [
+        ("I", "new_bur_1", "old_bur_1", None),
+        ("U", None, None, "row_wid_1")
+    ]
+    schema = StructType([
+        StructField("o_Flag", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("LKP_NEW_BUR", StringType(), True),
+        StructField("LKP_ROW_WID", StringType(), True)
+    ])
+    df = spark_session.createDataFrame(test_data, schema)
+
+    # Mock write operation
+    mock_write.format.return_value.mode.return_value.save.return_value = None
+
+    # Execute load method
+    pipeline = MagicMock()
+    pipeline.config = config
+    pipeline.load(df)
+
+    # Validate write operations
+    mock_write.format.assert_called_with("delta")
+    mock_write.mode.assert_called_with("append")
+    mock_write.save.assert_any_call('/mock/path/insert')
+    mock_write.save.assert_any_call('/mock/path/update')
