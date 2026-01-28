@@ -1,0 +1,44 @@
+version: 2
+
+sources:
+  - name: snowflake_cloud_data_warehouse_v2
+    description: Source data from Snowflake Cloud Data Warehouse V2.
+    database: Snowflake Cloud Data Warehouse V2
+    schema: CDH_GWODS
+
+    tables:
+      - name: CDH_GW_BUR
+        description: Error: 002003 (02000): 01c208e2-0211-0688-0008-19fb0161bc0a: SQL compilation error:
+Schema 'GENAI_POWER_BI.CDH_GWODS' does not exist or not authorized.
+        identifier: CDH_GW_BUR
+        columns: []
+
+      - name: W_CLAIM_CD_BUR_SCD3_I
+        description: Error: 002003 (02000): 01c208e2-0211-0e71-0008-19fb0162502a: SQL compilation error:
+Schema 'GENAI_POWER_BI.CDH_GWODS' does not exist or not authorized.
+        identifier: W_CLAIM_CD_BUR_SCD3_I
+        columns: []
+
+      - name: W_CLAIM_CD_BUR_SCD3_U
+        description: Error: 002003 (02000): 01c208e2-0211-02c6-0008-19fb016233ea: SQL compilation error:
+Schema 'GENAI_POWER_BI.CDH_GWODS' does not exist or not authorized.
+        identifier: W_CLAIM_CD_BUR_SCD3_U
+        columns: []
+
+      - name: LKP_W_CLAIM_CD_BUR_SCD3
+        description: Error: 002003 (02000): 01c208e2-0211-0c4d-0008-19fb01620a2a: SQL compilation error:
+Schema 'GENAI_POWER_BI.CDH_GWODS' does not exist or not authorized.
+        identifier: LKP_W_CLAIM_CD_BUR_SCD3
+        columns: []
+
+      - name: MPLT_CDM_BATCH_ID_LKP_CDM_BATCH_CTRLID
+        description: Error: 002003 (02000): 01c208e2-0210-f72b-0008-19fb01624082: SQL compilation error:
+Schema 'GENAI_POWER_BI.CDH_GWODS' does not exist or not authorized.
+        identifier: MPLT_CDM_BATCH_ID_LKP_CDM_BATCH_CTRLID
+        columns: []
+
+      - name: MPLT_CDM_ROW_WID_LKP_MAX_ROW_WID
+        description: Error: 002003 (02000): 01c208e2-0210-ff16-0008-19fb01622a2a: SQL compilation error:
+Schema 'GENAI_POWER_BI.CDH_GWODS' does not exist or not authorized.
+        identifier: MPLT_CDM_ROW_WID_LKP_MAX_ROW_WID
+        columns: []
