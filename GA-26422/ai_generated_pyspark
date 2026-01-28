@@ -4,12 +4,11 @@ MAPPING FILE: mplt_CDM_BATCH_ID.txt
 """
 ETL Pipeline: mplt_CDM_BATCH_ID
 Migrated from IICS mapping: mplt_CDM_BATCH_ID
-Description: Processes batch IDs by checking for null values, performing a lookup to retrieve the maximum batch ID for a given source name, and outputs either the lookup value or a default value (-999) if the batch ID is null.
 """
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
+from typing import Dict
 import logging
 import os
 
@@ -26,7 +25,7 @@ def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
     Read data from catalog (Databricks) or local file based on environment.
 
     Args:
-        table_name: Full table name in format "catalog.database.table" (e.g., "CDM.CDM_BATCH_CTRLID").
+        table_name: Full table name in format "catalog.database.table".
         local_file_path: Local CSV file path for non-Databricks environment.
 
     Returns:
@@ -57,16 +56,16 @@ def log_df_info(df: DataFrame, step_name: str):
     except Exception as e:
         logger.error(f"Error logging DataFrame info: {str(e)}")
 
-class CDMBatchIDMapplet:
+class CDMBatchIDPipeline:
     """
     ETL Pipeline for processing batch IDs.
 
     Sources: CDM.CDM_BATCH_CTRLID
-    Targets: Processed Batch ID and Source Name
-    Transformation Logic: Null check, lookup, and default value handling.
+    Targets: o_BATCH_ID
+    Transformation Logic: Lookup maximum batch ID for a source name, handle nulls, and output the batch ID.
     """
 
-    def __init__(self, spark: SparkSession, config: dict):
+    def __init__(self, spark: SparkSession, config: Dict):
         self.spark = spark
         self.config = config
         self._configure_spark()
@@ -94,7 +93,7 @@ class CDMBatchIDMapplet:
         """
         logger.info("Starting data extraction")
 
-        table_name = self.config.get('source_table', 'CDM.CDM_BATCH_CTRLID')
+        table_name = self.config.get('source_table', 'catalog.database.table')
         local_file_path = self.config.get('source_local_path', None)
 
         df = read_table(
@@ -103,16 +102,6 @@ class CDMBatchIDMapplet:
         )
 
         log_df_info(df, "Source: CDM_BATCH_CTRLID")
-
-        # Apply filters if specified (predicate pushdown)
-        if 'filter_conditions' in self.config:
-            for condition in self.config['filter_conditions']:
-                df = df.filter(condition)
-
-        # Select only required columns (column pruning)
-        if 'required_columns' in self.config:
-            df = df.select(*self.config['required_columns'])
-
         logger.info("Data extraction complete")
         return df
 
@@ -121,37 +110,44 @@ class CDMBatchIDMapplet:
         Apply business transformations.
 
         Transformation Logic:
-        - Lookup maximum batch ID for source name.
-        - Null check and default value handling.
+        - Lookup maximum batch ID for a source name.
+        - Handle null values in batch ID.
         """
         logger.info("Applying transformations")
 
-        # Perform lookup transformation
-        lookup_table_name = self.config.get('lookup_table', 'CDM.CDM_BATCH_CTRLID')
+        # Step 1: Pass-through SOURCE_NAME
+        df = df.select(
+            F.col("SOURCE_NAME").alias("SOURCE_NAME")
+        )
+
+        # Step 2: Perform lookup to retrieve maximum batch ID
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.lookup_table')
         lookup_local_path = self.config.get('lookup_local_path', None)
 
         lookup_df = read_table(
             table_name=lookup_table_name,
             local_file_path=lookup_local_path
+        ).select(
+            F.col("SOURCE_NAME").alias("lookup_SOURCE_NAME"),
+            F.col("BATCH_ID").alias("lookup_BATCH_ID")
         )
 
-        # Perform lookup join
         df = df.join(
-            F.broadcast(lookup_df.select(
-                F.col("SOURCE_NAME").alias("lookup_SOURCE_NAME"),
-                F.col("BATCH_ID").alias("lookup_BATCH_ID")
-            )),
+            F.broadcast(lookup_df),
             df.SOURCE_NAME == lookup_df.lookup_SOURCE_NAME,
             "left"
-        ).drop("lookup_SOURCE_NAME")
+        ).select(
+            df.SOURCE_NAME,
+            lookup_df.lookup_BATCH_ID.alias("LKP_BATCH_ID")
+        )
 
-        # Null check and default value handling
+        # Step 3: Null check and batch ID assignment
         df = df.withColumn(
             "o_BATCH_ID",
-            F.when(F.col("lookup_BATCH_ID").isNull(), F.lit(-999)).otherwise(F.col("lookup_BATCH_ID"))
+            F.when(F.col("LKP_BATCH_ID").isNull(), F.lit(-999)).otherwise(F.col("LKP_BATCH_ID"))
         ).select(
-            F.col("SOURCE_NAME"),
-            F.col("o_BATCH_ID")
+            F.col("o_BATCH_ID"),
+            F.col("SOURCE_NAME")
         )
 
         log_df_info(df, "After transformations")
@@ -167,27 +163,16 @@ class CDMBatchIDMapplet:
         """
         logger.info("Starting data load")
 
-        target_path = self.config.get('target_path', '/path/to/target')
+        target_path = self.config.get('target_path', 'path/to/target')
 
         log_df_info(df, "Before load")
 
         (df.write
             .format("delta")
             .mode(self.config.get('write_mode', 'overwrite'))
-            .partitionBy(*self.config.get('partition_columns', []))
             .option("overwriteSchema", "true")
             .save(target_path)
         )
-
-        # Optimize target table
-        if self.config.get('optimize_target', True):
-            logger.info("Optimizing target table")
-            zorder_cols = self.config.get('zorder_columns', [])
-            if zorder_cols:
-                self.spark.sql(f"""
-                    OPTIMIZE delta.`{target_path}`
-                    ZORDER BY ({', '.join(zorder_cols)})
-                """)
 
         logger.info("Data load complete")
 
@@ -223,26 +208,19 @@ config = {
     # Target configuration
     'target_path': '/path/to/target',
     'write_mode': 'overwrite',
-    'partition_columns': ['SOURCE_NAME'],
-    'zorder_columns': ['SOURCE_NAME', 'o_BATCH_ID'],
-
-    # Transformation configuration
-    'required_columns': ['SOURCE_NAME'],
-    'filter_conditions': ["STATUS = 'RUNNING'"],
 
     # Lookup configuration
     'lookup_table': 'CDM.CDM_BATCH_CTRLID',
     'lookup_local_path': r'path/to/lookup.csv',
 
     # Performance configuration
-    'shuffle_partitions': 200,
-    'optimize_target': True
+    'shuffle_partitions': 200
 }
 
 # Execute
 if __name__ == "__main__":
-    spark = SparkSession.builder.appName("ETL_Pipeline_mplt_CDM_BATCH_ID").getOrCreate()
-    pipeline = CDMBatchIDMapplet(spark, config)
+    spark = SparkSession.builder.appName("CDM_BATCH_ID_Pipeline").getOrCreate()
+    pipeline = CDMBatchIDPipeline(spark, config)
     pipeline.execute()
 MAPPING FILE: m_CDM_W_CLAIM_CD_SCD3_IU.txt
 ====================================================================================================
@@ -274,14 +252,13 @@ def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
     Read data from catalog (Databricks) or local file based on environment.
 
     Args:
-        table_name: Full table name in format "catalog.database.table" (e.g., "CDH_GWODS.CDH_GW_BUR")
-        local_file_path: Local CSV file path for non-Databricks environment (e.g., r"path/to/local_file.csv")
+        table_name: Full table name in format "catalog.database.table".
+        local_file_path: Local CSV file path for non-Databricks environment.
 
     Returns:
-        DataFrame from catalog or local file
+        DataFrame from catalog or local file.
     """
     is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
-
     if is_databricks:
         logger.info(f"Reading from catalog: {table_name}")
         return spark.table(table_name)
@@ -296,8 +273,8 @@ def log_df_info(df: DataFrame, step_name: str):
     Log DataFrame information for debugging.
 
     Args:
-        df: DataFrame to log
-        step_name: Description of the step
+        df: DataFrame to log.
+        step_name: Description of the step.
     """
     try:
         logger.info(f"{step_name}: {len(df.columns)} columns")
@@ -307,11 +284,11 @@ def log_df_info(df: DataFrame, step_name: str):
 
 class CDMClaimSCD3Pipeline:
     """
-    ETL Pipeline for m_CDM_W_CLAIM_CD_SCD3_IU
+    ETL Pipeline for processing SCD Type 3 logic for `BUR` field.
 
     Sources: CDH_GW_BUR
     Targets: W_CLAIM_CD_BUR_SCD3_I (Insert), W_CLAIM_CD_BUR_SCD3_U (Update)
-    Transformation Logic: Implements SCD Type 3 logic for handling changes in the `BUR` field.
+    Transformation Logic: Extract, transform, and load with SCD Type 3 handling.
     """
 
     def __init__(self, spark: SparkSession, config: Dict):
@@ -328,7 +305,6 @@ class CDMClaimSCD3Pipeline:
             "spark.sql.adaptive.coalescePartitions.enabled": "true",
             "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
         }
-
         for key, value in configs.items():
             self.spark.conf.set(key, value)
 
@@ -336,158 +312,130 @@ class CDMClaimSCD3Pipeline:
         """
         Extract data from source table `CDH_GW_BUR`.
 
-        Optimizations:
-        - Predicate pushdown for filters
-        - Column pruning to select only required fields
+        Returns:
+            Extracted DataFrame.
         """
         logger.info("Starting data extraction")
-
-        table_name = self.config.get('source_table', 'CDH_GWODS.CDH_GW_BUR')
+        table_name = self.config.get('source_table', 'catalog.database.table')
         local_file_path = self.config.get('source_local_path', None)
 
         df = read_table(table_name=table_name, local_file_path=local_file_path)
-
-        # Apply custom SQL query transformation
-        df = df.select(
-            F.col("POLICY_STATE"),
-            F.col("BUR"),
-            F.lit("GWCDH").alias("SOURCE_NAME")
-        )
-
         log_df_info(df, "Source: CDH_GW_BUR")
-        logger.info("Data extraction complete")
         return df
 
-    def transform(self, df: DataFrame) -> DataFrame:
+    def transform(self, df: DataFrame) -> Dict[str, DataFrame]:
         """
-        Apply transformations including expressions, lookups, and flag evaluation.
+        Apply transformations including expressions, lookups, and router logic.
+
+        Args:
+            df: Extracted DataFrame.
+
+        Returns:
+            Dictionary of DataFrames for Insert and Update operations.
         """
         logger.info("Applying transformations")
 
-        # Step 2: Expression Transformation
+        # Step 2: Expression Transformation - EXP_BUR
         df = df.select(
             F.col("POLICY_STATE").alias("INTEGRATION_ID"),
             F.col("BUR"),
-            F.col("SOURCE_NAME")
+            F.lit("GWCDH").alias("SOURCE_NAME")
         )
+        log_df_info(df, "After EXP_BUR")
 
-        # Step 3: Lookup Transformation
-        lookup_table_name = self.config.get('lookup_table', 'CDM.W_CLAIM_CD_BUR_SCD3')
+        # Step 3: Lookup Transformation - LKP_W_CLAIM_CD_BUR_SCD3
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.lookup_table')
         lookup_local_path = self.config.get('lookup_local_path', None)
+        lookup_df = read_table(table_name=lookup_table_name, local_file_path=lookup_local_path)
 
-        lookup_df = read_table(
-            table_name=lookup_table_name,
-            local_file_path=lookup_local_path
-        ).select("LKP_ROW_WID", "LKP_INTEGRATION_ID", "LKP_NEW_BUR")
-
+        lookup_df = lookup_df.select(
+            F.col("LKP_ROW_WID"),
+            F.col("LKP_INTEGRATION_ID"),
+            F.col("LKP_NEW_BUR")
+        )
         df = df.join(
             F.broadcast(lookup_df),
             df.INTEGRATION_ID == lookup_df.LKP_INTEGRATION_ID,
             "left"
-        ).select(
-            df["*"],
-            lookup_df["LKP_ROW_WID"],
-            lookup_df["LKP_NEW_BUR"]
-        )
+        ).drop("LKP_INTEGRATION_ID")
+        log_df_info(df, "After LKP_W_CLAIM_CD_BUR_SCD3")
 
-        # Step 4: Flag Evaluation
+        # Step 4: Expression Transformation - EXP_Flag
         df = df.withColumn(
             "o_Flag",
             F.when(F.col("LKP_ROW_WID").isNull(), "I")
             .when(F.md5(F.col("BUR")) == F.md5(F.col("LKP_NEW_BUR")), "NC")
             .otherwise("U")
-        ).withColumn(
-            "CDM_INSERT_DT",
-            F.when(F.col("o_Flag") == "I", F.current_timestamp())
-        ).withColumn(
-            "CDM_UPDATE_DT",
-            F.when(F.col("o_Flag") == "U", F.current_timestamp())
-        ).withColumn(
-            "TGT_TABLE_NAME",
-            F.lit("W_CLAIM_CD_BUR_SCD3")
+        ).withColumn("CDM_INSERT_DT", F.current_timestamp()) \
+         .withColumn("CDM_UPDATE_DT", F.current_timestamp()) \
+         .withColumn("TGT_TABLE_NAME", F.lit("W_CLAIM_CD_BUR_SCD3"))
+        log_df_info(df, "After EXP_Flag")
+
+        # Step 5: Router Transformation - rtr_CLM_INSERT_UPD
+        insert_df = df.filter(F.col("o_Flag") == "I").select(
+            "o_Flag", "CDM_INSERT_DT", "TGT_TABLE_NAME", "BUR"
         )
+        update_df = df.filter(F.col("o_Flag") == "U").select(
+            "o_Flag", "CDM_UPDATE_DT", "TGT_TABLE_NAME", "BUR"
+        )
+        log_df_info(insert_df, "Insert Group")
+        log_df_info(update_df, "Update Group")
 
-        log_df_info(df, "After transformations")
-        return df
+        return {"insert": insert_df, "update": update_df}
 
-    def load(self, df: DataFrame):
+    def load(self, dataframes: Dict[str, DataFrame]):
         """
-        Load data into target tables for insert and update operations.
+        Load data into target tables.
 
-        Optimizations:
-        - Delta Lake for ACID compliance
-        - Partitioning for query performance
-        - Z-ordering for frequently queried columns
+        Args:
+            dataframes: Dictionary of DataFrames for Insert and Update operations.
         """
         logger.info("Starting data load")
 
-        target_path_insert = self.config.get('target_path_insert', '/path/to/insert_target')
-        target_path_update = self.config.get('target_path_update', '/path/to/update_target')
+        # Load Insert Data
+        insert_path = self.config.get('insert_target_path', '/path/to/insert_target')
+        dataframes["insert"].write.format("delta").mode("append").save(insert_path)
+        logger.info(f"Insert data loaded to {insert_path}")
 
-        # Split data into INSERT and UPDATE groups
-        insert_df = df.filter(F.col("o_Flag") == "I").select("ROW_WID", "NEW_BUR", "OLD_BUR", "BATCH_ID")
-        update_df = df.filter(F.col("o_Flag") == "U").select("ROW_WID", "NEW_BUR", "OLD_BUR", "BATCH_ID")
-
-        # Write INSERT records
-        (insert_df.write
-            .format("delta")
-            .mode("append")
-            .save(target_path_insert)
-        )
-
-        # Write UPDATE records
-        (update_df.write
-            .format("delta")
-            .mode("append")
-            .save(target_path_update)
-        )
-
-        logger.info("Data load complete")
+        # Load Update Data
+        update_path = self.config.get('update_target_path', '/path/to/update_target')
+        dataframes["update"].write.format("delta").mode("append").save(update_path)
+        logger.info(f"Update data loaded to {update_path}")
 
     def execute(self):
         """
         Execute the complete ETL pipeline.
         """
         logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
-
         try:
             # Extract
             source_df = self.extract()
 
             # Transform
-            transformed_df = self.transform(source_df)
+            transformed_data = self.transform(source_df)
 
             # Load
-            self.load(transformed_df)
+            self.load(transformed_data)
 
             logger.info("ETL pipeline completed successfully")
-
         except Exception as e:
             logger.error(f"ETL pipeline failed: {str(e)}")
             raise
 
-
 # Configuration
 config = {
-    # Source configuration
-    'source_table': 'CDH_GWODS.CDH_GW_BUR',
-    'source_local_path': r'path/to/source.csv',
-
-    # Target configuration
-    'target_path_insert': '/path/to/insert_target',
-    'target_path_update': '/path/to/update_target',
-
-    # Lookup configuration
+    'source_table': 'CDH_GW_BUR',
+    'source_local_path': r'/path/to/source.csv',
     'lookup_table': 'CDM.W_CLAIM_CD_BUR_SCD3',
-    'lookup_local_path': r'path/to/lookup.csv',
-
-    # Performance configuration
+    'lookup_local_path': r'/path/to/lookup.csv',
+    'insert_target_path': '/path/to/insert_target',
+    'update_target_path': '/path/to/update_target',
     'shuffle_partitions': 200
 }
 
 # Execute
 if __name__ == "__main__":
-    spark = SparkSession.builder.appName("ETL_Pipeline").getOrCreate()
+    spark = SparkSession.builder.appName("CDMClaimSCD3Pipeline").getOrCreate()
     pipeline = CDMClaimSCD3Pipeline(spark, config)
     pipeline.execute()
 MAPPING FILE: mplt_CDM_ROW_WID.txt
@@ -496,17 +444,13 @@ MAPPING FILE: mplt_CDM_ROW_WID.txt
 """
 ETL Pipeline: mplt_CDM_ROW_WID
 Migrated from IICS mapping: mplt_CDM_ROW_WID
-
-Purpose:
-This pipeline retrieves the maximum ROW_WID for a given TABLE_NAME, calculates a new ROW_WID value, and inserts it into the target table.
-
-Source: CUSTOM_TABLE
-Target: $$SCHEMA_CDM.$$TGT_TABLE_NAME
 """
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from delta.tables import DeltaTable
+from typing import Dict
 import logging
 import os
 
@@ -556,17 +500,14 @@ def log_df_info(df: DataFrame, step_name: str):
 
 class CDMRowWidPipeline:
     """
-    ETL Pipeline for mplt_CDM_ROW_WID.
+    ETL Pipeline for calculating ROW_WID based on lookup and transformation logic.
 
-    Sources: CUSTOM_TABLE
-    Targets: $$SCHEMA_CDM.$$TGT_TABLE_NAME
-    Transformation Logic:
-    - Lookup maximum ROW_WID for a given TABLE_NAME.
-    - Calculate new ROW_WID value.
-    - Insert new ROW_WID into target table.
+    Sources: Custom Table
+    Targets: Output Table
+    Transformation Logic: Lookup maximum ROW_WID, calculate new ROW_WID, and output to target.
     """
 
-    def __init__(self, spark: SparkSession, config: dict):
+    def __init__(self, spark: SparkSession, config: Dict):
         self.spark = spark
         self.config = config
         self._configure_spark()
@@ -602,61 +543,67 @@ class CDMRowWidPipeline:
             local_file_path=local_file_path
         )
 
-        log_df_info(df, "Source: CUSTOM_TABLE")
+        log_df_info(df, "Source: Custom Table")
         logger.info("Data extraction complete")
         return df
 
-    def lookup_max_row_wid(self, table_name: str) -> DataFrame:
+    def lookup_max_row_wid(self, in_table_name: str) -> DataFrame:
         """
         Perform lookup to retrieve maximum ROW_WID and associated TABLE_NAME.
 
         Args:
-            table_name: Name of the table to perform lookup on.
+            in_table_name: Input table name for lookup condition.
 
         Returns:
             DataFrame with ROW_WID and TABLE_NAME.
         """
         logger.info("Performing lookup for maximum ROW_WID")
 
-        lookup_query = f"""
-            SELECT NVL(MAX(ROW_WID), 0) AS ROW_WID, TABLE_NAME
-            FROM {self.config.get('target_table')}
-            WHERE TABLE_NAME = '{table_name}'
-        """
-        lookup_df = self.spark.sql(lookup_query)
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.lookup_table')
+        lookup_local_path = self.config.get('lookup_local_path', None)
 
-        log_df_info(lookup_df, "Lookup: Maximum ROW_WID")
-        return lookup_df
+        lookup_df = read_table(
+            table_name=lookup_table_name,
+            local_file_path=lookup_local_path
+        )
 
-    def transform(self, lookup_df: DataFrame) -> DataFrame:
+        # Filter lookup table based on IN_TABLE_NAME
+        lookup_result = lookup_df.filter(F.col("TABLE_NAME") == in_table_name).select(
+            F.coalesce(F.max("ROW_WID"), F.lit(0)).alias("ROW_WID"),
+            F.lit(in_table_name).alias("TABLE_NAME")
+        )
+
+        log_df_info(lookup_result, "Lookup Result")
+        return lookup_result
+
+    def calculate_new_row_wid(self, lookup_df: DataFrame) -> DataFrame:
         """
-        Apply transformations to calculate new ROW_WID.
+        Calculate new ROW_WID using lookup results and conditional logic.
 
         Args:
             lookup_df: DataFrame containing lookup results.
 
         Returns:
-            Transformed DataFrame with new ROW_WID.
+            DataFrame with calculated ROW_WID.
         """
-        logger.info("Applying transformations to calculate new ROW_WID")
+        logger.info("Calculating new ROW_WID")
 
-        # Calculate new ROW_WID
+        # Add conditional logic and increment ROW_WID
         transformed_df = lookup_df.withColumn(
             "ROW_WID",
-            F.col("ROW_WID") + 1
+            F.when(F.col("ROW_WID") == 0, F.lit(1)).otherwise(F.col("ROW_WID") + 1)
         )
 
-        log_df_info(transformed_df, "Transformed DataFrame")
+        log_df_info(transformed_df, "Transformed Data")
         return transformed_df
 
     def load(self, df: DataFrame):
         """
-        Load data to target table.
+        Load data to target.
 
         Optimizations:
         - Delta Lake for ACID compliance.
         - Partitioning for query performance.
-        - Z-ordering for frequently queried columns.
         """
         logger.info("Starting data load")
 
@@ -666,8 +613,7 @@ class CDMRowWidPipeline:
 
         (df.write
             .format("delta")
-            .mode(self.config.get('write_mode', 'append'))
-            .partitionBy(*self.config.get('partition_columns', []))
+            .mode(self.config.get('write_mode', 'overwrite'))
             .option("overwriteSchema", "true")
             .save(target_path)
         )
@@ -695,10 +641,10 @@ class CDMRowWidPipeline:
             source_df = self.extract()
 
             # Lookup
-            lookup_df = self.lookup_max_row_wid(self.config.get('lookup_table_name'))
+            lookup_df = self.lookup_max_row_wid(self.config.get('in_table_name', 'default_table_name'))
 
             # Transform
-            transformed_df = self.transform(lookup_df)
+            transformed_df = self.calculate_new_row_wid(lookup_df)
 
             # Load
             self.load(transformed_df)
@@ -714,17 +660,19 @@ class CDMRowWidPipeline:
 config = {
     # Source configuration
     'source_table': 'catalog.database.source_table',
-    'source_local_path': r'path/to/source.csv',
-
-    # Target configuration
-    'target_table': 'catalog.database.target_table',
-    'target_path': '/path/to/target',
-    'write_mode': 'append',
-    'partition_columns': ['TABLE_NAME'],
-    'zorder_columns': ['ROW_WID', 'TABLE_NAME'],
+    'source_local_path': r'path\to\source.csv',
 
     # Lookup configuration
-    'lookup_table_name': 'CUSTOM_TABLE',
+    'lookup_table': 'catalog.database.lookup_table',
+    'lookup_local_path': r'path\to\lookup.csv',
+
+    # Target configuration
+    'target_path': '/path/to/target',
+    'write_mode': 'overwrite',
+    'zorder_columns': ['ROW_WID'],
+
+    # Transformation configuration
+    'in_table_name': 'example_table_name',
 
     # Performance configuration
     'shuffle_partitions': 200,
