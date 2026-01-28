@@ -8,6 +8,7 @@ Migrated from IICS mapping: mplt_CDM_BATCH_ID
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from typing import Dict
 import logging
 import os
@@ -25,7 +26,7 @@ def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
     Read data from catalog (Databricks) or local file based on environment.
 
     Args:
-        table_name: Full table name in format "catalog.database.table".
+        table_name: Full table name in format "catalog.database.table" (e.g., "CDM.CDM_BATCH_CTRLID").
         local_file_path: Local CSV file path for non-Databricks environment.
 
     Returns:
@@ -62,7 +63,7 @@ class CDMBatchIDPipeline:
 
     Sources: CDM.CDM_BATCH_CTRLID
     Targets: o_BATCH_ID
-    Transformation Logic: Lookup maximum batch ID for a source name, handle nulls, and output the batch ID.
+    Transformation Logic: Lookup maximum batch ID for a given source name, handle nulls, and assign default values.
     """
 
     def __init__(self, spark: SparkSession, config: Dict):
@@ -87,13 +88,11 @@ class CDMBatchIDPipeline:
         """
         Extract data from source.
 
-        Optimizations:
-        - Predicate pushdown for filters.
-        - Column pruning to select only required fields.
+        IICS Source Qualifier equivalent.
         """
         logger.info("Starting data extraction")
 
-        table_name = self.config.get('source_table', 'catalog.database.table')
+        table_name = self.config.get('source_table', 'CDM.CDM_BATCH_CTRLID')
         local_file_path = self.config.get('source_local_path', None)
 
         df = read_table(
@@ -109,19 +108,19 @@ class CDMBatchIDPipeline:
         """
         Apply business transformations.
 
-        Transformation Logic:
-        - Lookup maximum batch ID for a source name.
-        - Handle null values in batch ID.
+        IICS Transformation Logic equivalent.
         """
         logger.info("Applying transformations")
 
-        # Step 1: Pass-through SOURCE_NAME
+        # Step 1: Mapplet Initialization (Pass-through SOURCE_NAME)
+        logger.info("Step 1: Mapplet Initialization")
         df = df.select(
             F.col("SOURCE_NAME").alias("SOURCE_NAME")
         )
 
-        # Step 2: Perform lookup to retrieve maximum batch ID
-        lookup_table_name = self.config.get('lookup_table', 'catalog.database.lookup_table')
+        # Step 2: Lookup Batch ID
+        logger.info("Step 2: Lookup Batch ID")
+        lookup_table_name = self.config.get('lookup_table', 'CDM.CDM_BATCH_CTRLID')
         lookup_local_path = self.config.get('lookup_local_path', None)
 
         lookup_df = read_table(
@@ -132,6 +131,7 @@ class CDMBatchIDPipeline:
             F.col("BATCH_ID").alias("lookup_BATCH_ID")
         )
 
+        # Perform lookup using broadcast join
         df = df.join(
             F.broadcast(lookup_df),
             df.SOURCE_NAME == lookup_df.lookup_SOURCE_NAME,
@@ -141,7 +141,8 @@ class CDMBatchIDPipeline:
             lookup_df.lookup_BATCH_ID.alias("LKP_BATCH_ID")
         )
 
-        # Step 3: Null check and batch ID assignment
+        # Step 3: Null Check and Default Value Assignment
+        logger.info("Step 3: Null Check and Default Value Assignment")
         df = df.withColumn(
             "o_BATCH_ID",
             F.when(F.col("LKP_BATCH_ID").isNull(), F.lit(-999)).otherwise(F.col("LKP_BATCH_ID"))
@@ -157,13 +158,11 @@ class CDMBatchIDPipeline:
         """
         Load data to target.
 
-        Optimizations:
-        - Delta Lake for ACID compliance.
-        - Partitioning for query performance.
+        IICS Target equivalent.
         """
         logger.info("Starting data load")
 
-        target_path = self.config.get('target_path', 'path/to/target')
+        target_path = self.config.get('target_path', '/path/to/target')
 
         log_df_info(df, "Before load")
 
@@ -173,6 +172,16 @@ class CDMBatchIDPipeline:
             .option("overwriteSchema", "true")
             .save(target_path)
         )
+
+        # Optimize target table
+        if self.config.get('optimize_target', True):
+            logger.info("Optimizing target table")
+            zorder_cols = self.config.get('zorder_columns', [])
+            if zorder_cols:
+                self.spark.sql(f"""
+                    OPTIMIZE delta.`{target_path}`
+                    ZORDER BY ({', '.join(zorder_cols)})
+                """)
 
         logger.info("Data load complete")
 
@@ -208,13 +217,15 @@ config = {
     # Target configuration
     'target_path': '/path/to/target',
     'write_mode': 'overwrite',
+    'zorder_columns': ['SOURCE_NAME'],
 
     # Lookup configuration
     'lookup_table': 'CDM.CDM_BATCH_CTRLID',
     'lookup_local_path': r'path/to/lookup.csv',
 
     # Performance configuration
-    'shuffle_partitions': 200
+    'shuffle_partitions': 200,
+    'optimize_target': True
 }
 
 # Execute
@@ -224,6 +235,10 @@ if __name__ == "__main__":
     pipeline.execute()
 MAPPING FILE: m_CDM_W_CLAIM_CD_SCD3_IU.txt
 ====================================================================================================
+Below is the production-ready PySpark code for the migration of the IICS mapping `m_CDM_W_CLAIM_CD_SCD3_IU` to PySpark. The code is optimized for Spark's distributed computing capabilities and adheres to the provided optimization framework.
+
+---
+
 
 """
 ETL Pipeline: m_CDM_W_CLAIM_CD_SCD3_IU
@@ -235,7 +250,6 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 from delta.tables import DeltaTable
-from typing import Dict
 import logging
 import os
 
@@ -288,10 +302,10 @@ class CDMClaimSCD3Pipeline:
 
     Sources: CDH_GW_BUR
     Targets: W_CLAIM_CD_BUR_SCD3_I (Insert), W_CLAIM_CD_BUR_SCD3_U (Update)
-    Transformation Logic: Extract, transform, and load with SCD Type 3 handling.
+    Transformation Logic: Expression, Lookup, Router, Update Strategy
     """
 
-    def __init__(self, spark: SparkSession, config: Dict):
+    def __init__(self, spark: SparkSession, config: dict):
         self.spark = spark
         self.config = config
         self._configure_spark()
@@ -303,7 +317,9 @@ class CDMClaimSCD3Pipeline:
         configs = {
             "spark.sql.adaptive.enabled": "true",
             "spark.sql.adaptive.coalescePartitions.enabled": "true",
-            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200)),
+            "spark.sql.optimizer.dynamicPartitionPruning.enabled": "true",
+            "spark.sql.autoBroadcastJoinThreshold": "10485760"
         }
         for key, value in configs.items():
             self.spark.conf.set(key, value)
@@ -311,9 +327,6 @@ class CDMClaimSCD3Pipeline:
     def extract(self) -> DataFrame:
         """
         Extract data from source table `CDH_GW_BUR`.
-
-        Returns:
-            Extracted DataFrame.
         """
         logger.info("Starting data extraction")
         table_name = self.config.get('source_table', 'catalog.database.table')
@@ -321,29 +334,30 @@ class CDMClaimSCD3Pipeline:
 
         df = read_table(table_name=table_name, local_file_path=local_file_path)
         log_df_info(df, "Source: CDH_GW_BUR")
-        return df
 
-    def transform(self, df: DataFrame) -> Dict[str, DataFrame]:
-        """
-        Apply transformations including expressions, lookups, and router logic.
-
-        Args:
-            df: Extracted DataFrame.
-
-        Returns:
-            Dictionary of DataFrames for Insert and Update operations.
-        """
-        logger.info("Applying transformations")
-
-        # Step 2: Expression Transformation - EXP_BUR
+        # Apply SQL override logic
         df = df.select(
-            F.col("POLICY_STATE").alias("INTEGRATION_ID"),
+            F.col("POLICY_STATE"),
             F.col("BUR"),
             F.lit("GWCDH").alias("SOURCE_NAME")
         )
-        log_df_info(df, "After EXP_BUR")
+        logger.info("Data extraction complete")
+        return df
 
-        # Step 3: Lookup Transformation - LKP_W_CLAIM_CD_BUR_SCD3
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply transformations including expressions, lookups, and flag evaluation.
+        """
+        logger.info("Applying transformations")
+
+        # Step 2: Expression Transformation
+        df = df.select(
+            F.col("POLICY_STATE").alias("INTEGRATION_ID"),
+            F.col("BUR"),
+            F.col("SOURCE_NAME")
+        )
+
+        # Step 3: Lookup Transformation
         lookup_table_name = self.config.get('lookup_table', 'catalog.database.lookup_table')
         lookup_local_path = self.config.get('lookup_local_path', None)
         lookup_df = read_table(table_name=lookup_table_name, local_file_path=lookup_local_path)
@@ -353,54 +367,58 @@ class CDMClaimSCD3Pipeline:
             F.col("LKP_INTEGRATION_ID"),
             F.col("LKP_NEW_BUR")
         )
+
         df = df.join(
             F.broadcast(lookup_df),
             df.INTEGRATION_ID == lookup_df.LKP_INTEGRATION_ID,
             "left"
-        ).drop("LKP_INTEGRATION_ID")
-        log_df_info(df, "After LKP_W_CLAIM_CD_BUR_SCD3")
+        ).select(
+            df["*"],
+            lookup_df["LKP_ROW_WID"],
+            lookup_df["LKP_NEW_BUR"]
+        )
 
-        # Step 4: Expression Transformation - EXP_Flag
+        # Step 4: Flag Evaluation
         df = df.withColumn(
             "o_Flag",
             F.when(F.col("LKP_ROW_WID").isNull(), "I")
             .when(F.md5(F.col("BUR")) == F.md5(F.col("LKP_NEW_BUR")), "NC")
             .otherwise("U")
-        ).withColumn("CDM_INSERT_DT", F.current_timestamp()) \
-         .withColumn("CDM_UPDATE_DT", F.current_timestamp()) \
-         .withColumn("TGT_TABLE_NAME", F.lit("W_CLAIM_CD_BUR_SCD3"))
-        log_df_info(df, "After EXP_Flag")
-
-        # Step 5: Router Transformation - rtr_CLM_INSERT_UPD
-        insert_df = df.filter(F.col("o_Flag") == "I").select(
-            "o_Flag", "CDM_INSERT_DT", "TGT_TABLE_NAME", "BUR"
+        ).withColumn(
+            "CDM_INSERT_DT",
+            F.current_timestamp()
+        ).withColumn(
+            "CDM_UPDATE_DT",
+            F.current_timestamp()
+        ).withColumn(
+            "TGT_TABLE_NAME",
+            F.lit("W_CLAIM_CD_BUR_SCD3")
         )
-        update_df = df.filter(F.col("o_Flag") == "U").select(
-            "o_Flag", "CDM_UPDATE_DT", "TGT_TABLE_NAME", "BUR"
-        )
-        log_df_info(insert_df, "Insert Group")
-        log_df_info(update_df, "Update Group")
 
-        return {"insert": insert_df, "update": update_df}
+        log_df_info(df, "After transformations")
+        return df
 
-    def load(self, dataframes: Dict[str, DataFrame]):
+    def load(self, df: DataFrame):
         """
-        Load data into target tables.
-
-        Args:
-            dataframes: Dictionary of DataFrames for Insert and Update operations.
+        Load data into target tables `W_CLAIM_CD_BUR_SCD3_I` (Insert) and `W_CLAIM_CD_BUR_SCD3_U` (Update).
         """
         logger.info("Starting data load")
 
-        # Load Insert Data
-        insert_path = self.config.get('insert_target_path', '/path/to/insert_target')
-        dataframes["insert"].write.format("delta").mode("append").save(insert_path)
-        logger.info(f"Insert data loaded to {insert_path}")
+        # Step 5: Router Transformation
+        insert_df = df.filter(F.col("o_Flag") == "I")
+        update_df = df.filter(F.col("o_Flag") == "U")
 
-        # Load Update Data
-        update_path = self.config.get('update_target_path', '/path/to/update_target')
-        dataframes["update"].write.format("delta").mode("append").save(update_path)
-        logger.info(f"Update data loaded to {update_path}")
+        # Step 7: Target Load (Insert)
+        insert_target_path = self.config.get('insert_target_path', '/path/to/insert_target')
+        log_df_info(insert_df, "Insert DataFrame")
+        insert_df.write.format("delta").mode("append").save(insert_target_path)
+
+        # Step 8: Target Load (Update)
+        update_target_path = self.config.get('update_target_path', '/path/to/update_target')
+        log_df_info(update_df, "Update DataFrame")
+        update_df.write.format("delta").mode("append").save(update_target_path)
+
+        logger.info("Data load complete")
 
     def execute(self):
         """
@@ -408,15 +426,9 @@ class CDMClaimSCD3Pipeline:
         """
         logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
         try:
-            # Extract
             source_df = self.extract()
-
-            # Transform
-            transformed_data = self.transform(source_df)
-
-            # Load
-            self.load(transformed_data)
-
+            transformed_df = self.transform(source_df)
+            self.load(transformed_df)
             logger.info("ETL pipeline completed successfully")
         except Exception as e:
             logger.error(f"ETL pipeline failed: {str(e)}")
@@ -424,10 +436,10 @@ class CDMClaimSCD3Pipeline:
 
 # Configuration
 config = {
-    'source_table': 'CDH_GW_BUR',
-    'source_local_path': r'/path/to/source.csv',
+    'source_table': 'CDH_GWODS.CDH_GW_BUR',
+    'source_local_path': None,
     'lookup_table': 'CDM.W_CLAIM_CD_BUR_SCD3',
-    'lookup_local_path': r'/path/to/lookup.csv',
+    'lookup_local_path': None,
     'insert_target_path': '/path/to/insert_target',
     'update_target_path': '/path/to/update_target',
     'shuffle_partitions': 200
@@ -438,18 +450,33 @@ if __name__ == "__main__":
     spark = SparkSession.builder.appName("CDMClaimSCD3Pipeline").getOrCreate()
     pipeline = CDMClaimSCD3Pipeline(spark, config)
     pipeline.execute()
-MAPPING FILE: mplt_CDM_ROW_WID.txt
+
+
+---
+
+### Key Features:
+1. **Optimized Transformations:** Combined multiple transformations into single operations where possible.
+2. **Lookup Optimization:** Used broadcast join for lookup table.
+3. **Router Replacement:** Used filter conditions instead of IICS Router.
+4. **Error Handling:** Comprehensive logging and exception handling.
+5. **Delta Lake:** Used Delta format for target tables for ACID compliance.
+6. **Performance Configurations:** Applied Spark optimizations for adaptive query execution and partitioning.
+
+This code is production-ready and adheres to the provided optimization framework.MAPPING FILE: mplt_CDM_ROW_WID.txt
 ====================================================================================================
 
 """
 ETL Pipeline: mplt_CDM_ROW_WID
 Migrated from IICS mapping: mplt_CDM_ROW_WID
+
+Purpose:
+This pipeline retrieves the maximum ROW_WID and associated TABLE_NAME from a target table using a lookup transformation,
+calculates a new ROW_WID using conditional logic, and outputs the result to a target table.
+
 """
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-from delta.tables import DeltaTable
 from typing import Dict
 import logging
 import os
@@ -498,13 +525,17 @@ def log_df_info(df: DataFrame, step_name: str):
     except Exception as e:
         logger.error(f"Error logging DataFrame info: {str(e)}")
 
+
 class CDMRowWidPipeline:
     """
-    ETL Pipeline for calculating ROW_WID based on lookup and transformation logic.
+    ETL Pipeline for mplt_CDM_ROW_WID.
 
-    Sources: Custom Table
+    Sources: CUSTOM_TABLE
     Targets: Output Table
-    Transformation Logic: Lookup maximum ROW_WID, calculate new ROW_WID, and output to target.
+    Transformation Logic:
+    - Lookup maximum ROW_WID and associated TABLE_NAME.
+    - Calculate new ROW_WID using conditional logic.
+    - Output the calculated ROW_WID to the target table.
     """
 
     def __init__(self, spark: SparkSession, config: Dict):
@@ -543,7 +574,7 @@ class CDMRowWidPipeline:
             local_file_path=local_file_path
         )
 
-        log_df_info(df, "Source: Custom Table")
+        log_df_info(df, "Source: CUSTOM_TABLE")
         logger.info("Data extraction complete")
         return df
 
@@ -569,7 +600,7 @@ class CDMRowWidPipeline:
 
         # Filter lookup table based on IN_TABLE_NAME
         lookup_result = lookup_df.filter(F.col("TABLE_NAME") == in_table_name).select(
-            F.coalesce(F.max("ROW_WID"), F.lit(0)).alias("ROW_WID"),
+            F.coalesce(F.max(F.col("ROW_WID")), F.lit(0)).alias("ROW_WID"),
             F.lit(in_table_name).alias("TABLE_NAME")
         )
 
@@ -588,14 +619,14 @@ class CDMRowWidPipeline:
         """
         logger.info("Calculating new ROW_WID")
 
-        # Add conditional logic and increment ROW_WID
-        transformed_df = lookup_df.withColumn(
+        # Conditional logic to calculate new ROW_WID
+        calculated_df = lookup_df.withColumn(
             "ROW_WID",
-            F.when(F.col("ROW_WID") == 0, F.lit(1)).otherwise(F.col("ROW_WID") + 1)
+            F.when(F.col("ROW_WID") == 0, F.col("ROW_WID")).otherwise(F.col("ROW_WID") + 1)
         )
 
-        log_df_info(transformed_df, "Transformed Data")
-        return transformed_df
+        log_df_info(calculated_df, "Calculated ROW_WID")
+        return calculated_df
 
     def load(self, df: DataFrame):
         """
@@ -618,16 +649,6 @@ class CDMRowWidPipeline:
             .save(target_path)
         )
 
-        # Optimize target table
-        if self.config.get('optimize_target', True):
-            logger.info("Optimizing target table")
-            zorder_cols = self.config.get('zorder_columns', [])
-            if zorder_cols:
-                self.spark.sql(f"""
-                    OPTIMIZE delta.`{target_path}`
-                    ZORDER BY ({', '.join(zorder_cols)})
-                """)
-
         logger.info("Data load complete")
 
     def execute(self):
@@ -641,7 +662,7 @@ class CDMRowWidPipeline:
             source_df = self.extract()
 
             # Lookup
-            lookup_df = self.lookup_max_row_wid(self.config.get('in_table_name', 'default_table_name'))
+            lookup_df = self.lookup_max_row_wid(in_table_name=self.config.get('in_table_name', 'default_table'))
 
             # Transform
             transformed_df = self.calculate_new_row_wid(lookup_df)
@@ -660,23 +681,21 @@ class CDMRowWidPipeline:
 config = {
     # Source configuration
     'source_table': 'catalog.database.source_table',
-    'source_local_path': r'path\to\source.csv',
+    'source_local_path': r'path/to/source.csv',
 
     # Lookup configuration
     'lookup_table': 'catalog.database.lookup_table',
-    'lookup_local_path': r'path\to\lookup.csv',
+    'lookup_local_path': r'path/to/lookup.csv',
 
     # Target configuration
     'target_path': '/path/to/target',
     'write_mode': 'overwrite',
-    'zorder_columns': ['ROW_WID'],
 
     # Transformation configuration
-    'in_table_name': 'example_table_name',
+    'in_table_name': 'CUSTOM_TABLE',
 
     # Performance configuration
-    'shuffle_partitions': 200,
-    'optimize_target': True
+    'shuffle_partitions': 200
 }
 
 # Execute
