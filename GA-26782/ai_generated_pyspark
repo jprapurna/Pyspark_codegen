@@ -1,0 +1,728 @@
+MAPPING FILE: mplt_CDM_ROW_WID.txt
+====================================================================================================
+
+"""
+ETL Pipeline: mplt_CDM_ROW_WID
+Migrated from IICS mapping: mplt_CDM_ROW_WID
+
+Purpose:
+Retrieve the maximum ROW_WID and associated TABLE_NAME from a target table using a lookup transformation,
+calculate a new ROW_WID value, and output the result to a target table.
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from typing import Dict
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment.
+
+    Args:
+        table_name: Full table name in format "catalog.database.table".
+        local_file_path: Local CSV file path for non-Databricks environment.
+
+    Returns:
+        DataFrame from catalog or local file.
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging.
+
+    Args:
+        df: DataFrame to log.
+        step_name: Description of the step.
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class CDMRowWidPipeline:
+    """
+    ETL Pipeline for mplt_CDM_ROW_WID.
+
+    Sources: CUSTOM_TABLE
+    Targets: Output Table
+    Transformation Logic: Lookup maximum ROW_WID, calculate new ROW_WID, and output to target table.
+    """
+
+    def __init__(self, spark: SparkSession, config: Dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+
+    def _configure_spark(self):
+        """
+        Set Spark configurations for optimal performance.
+        """
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source.
+
+        IICS Source Qualifier equivalent.
+        """
+        logger.info("Starting data extraction")
+
+        table_name = self.config.get('source_table', 'catalog.database.table')
+        local_file_path = self.config.get('source_local_path', None)
+
+        df = read_table(
+            table_name=table_name,
+            local_file_path=local_file_path
+        )
+
+        log_df_info(df, "Source: CUSTOM_TABLE")
+        logger.info("Data extraction complete")
+        return df
+
+    def lookup_max_row_wid(self, df: DataFrame) -> DataFrame:
+        """
+        Perform lookup to retrieve maximum ROW_WID and associated TABLE_NAME.
+
+        IICS Lookup Transformation equivalent.
+        """
+        logger.info("Performing lookup for maximum ROW_WID")
+
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.lookup_table')
+        lookup_local_path = self.config.get('lookup_local_path', None)
+
+        lookup_df = read_table(
+            table_name=lookup_table_name,
+            local_file_path=lookup_local_path
+        )
+
+        # Perform lookup using broadcast join for optimization
+        lookup_result = df.join(
+            F.broadcast(lookup_df.select("TABLE_NAME", "ROW_WID")),
+            df["TABLE_NAME"] == lookup_df["TABLE_NAME"],
+            "left"
+        ).select(
+            df["TABLE_NAME"],
+            F.coalesce(lookup_df["ROW_WID"], F.lit(0)).alias("ROW_WID")
+        )
+
+        log_df_info(lookup_result, "Lookup Result")
+        return lookup_result
+
+    def calculate_new_row_wid(self, df: DataFrame) -> DataFrame:
+        """
+        Calculate new ROW_WID value using lookup results.
+
+        IICS Expression Transformation equivalent.
+        """
+        logger.info("Calculating new ROW_WID")
+
+        # Increment ROW_WID by 1
+        df = df.withColumn("ROW_WID", F.col("ROW_WID") + F.lit(1))
+
+        log_df_info(df, "After ROW_WID Calculation")
+        return df
+
+    def load(self, df: DataFrame):
+        """
+        Load data to target.
+
+        IICS Target equivalent.
+        """
+        logger.info("Starting data load")
+
+        target_path = self.config.get('target_path', 'path/to/target')
+
+        log_df_info(df, "Before load")
+
+        (df.write
+            .format("delta")
+            .mode(self.config.get('write_mode', 'overwrite'))
+            .option("overwriteSchema", "true")
+            .save(target_path)
+        )
+
+        # Optimize target table
+        if self.config.get('optimize_target', True):
+            logger.info("Optimizing target table")
+            zorder_cols = self.config.get('zorder_columns', [])
+            if zorder_cols:
+                self.spark.sql(f"""
+                    OPTIMIZE delta.`{target_path}`
+                    ZORDER BY ({', '.join(zorder_cols)})
+                """)
+
+        logger.info("Data load complete")
+
+    def execute(self):
+        """
+        Execute the complete ETL pipeline.
+        """
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+
+        try:
+            # Extract
+            source_df = self.extract()
+
+            # Lookup
+            lookup_df = self.lookup_max_row_wid(source_df)
+
+            # Transform
+            transformed_df = self.calculate_new_row_wid(lookup_df)
+
+            # Load
+            self.load(transformed_df)
+
+            logger.info("ETL pipeline completed successfully")
+
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+
+# Configuration
+config = {
+    # Source configuration
+    'source_table': 'catalog.database.source_table',
+    'source_local_path': r'path/to/source.csv',
+
+    # Lookup configuration
+    'lookup_table': 'catalog.database.lookup_table',
+    'lookup_local_path': r'path/to/lookup.csv',
+
+    # Target configuration
+    'target_path': '/path/to/target',
+    'write_mode': 'overwrite',
+    'zorder_columns': ['TABLE_NAME', 'ROW_WID'],
+
+    # Performance configuration
+    'shuffle_partitions': 200,
+    'optimize_target': True
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("CDM_ROW_WID_Pipeline").getOrCreate()
+    pipeline = CDMRowWidPipeline(spark, config)
+    pipeline.execute()
+MAPPING FILE: mplt_CDM_BATCH_ID.txt
+====================================================================================================
+
+"""
+ETL Pipeline: mplt_CDM_BATCH_ID
+Migrated from IICS mapping: mplt_CDM_BATCH_ID
+
+Description:
+This pipeline processes batch IDs by checking for null values and outputs the maximum batch ID for the incoming source name.
+It includes a lookup transformation to fetch the maximum batch ID and source name from the `CDM_BATCH_CTRLID` table, followed by null-check logic and final output processing.
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment.
+
+    Args:
+        table_name: Full table name in format "catalog.database.table" (e.g., "CDM.CDM_BATCH_CTRLID").
+        local_file_path: Local CSV file path for non-Databricks environment.
+
+    Returns:
+        DataFrame from catalog or local file.
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging.
+
+    Args:
+        df: DataFrame to log.
+        step_name: Description of the step.
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class CDMBatchIDPipeline:
+    """
+    ETL Pipeline for processing batch IDs.
+
+    Sources: CDM.CDM_BATCH_CTRLID
+    Targets: o_BATCH_ID
+    Transformation Logic: Fetch maximum batch ID, handle null values, and output processed batch ID.
+    """
+
+    def __init__(self, spark: SparkSession, config: dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+
+    def _configure_spark(self):
+        """
+        Set Spark configurations for optimal performance.
+        """
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source.
+
+        Optimizations:
+        - Predicate pushdown for filtering by STATUS_RUNNING.
+        - Column pruning to select only required fields.
+        """
+        logger.info("Starting data extraction")
+
+        table_name = self.config.get('source_table', 'CDM.CDM_BATCH_CTRLID')
+        local_file_path = self.config.get('source_local_path', None)
+
+        df = read_table(
+            table_name=table_name,
+            local_file_path=local_file_path
+        )
+
+        # Log DataFrame information
+        log_df_info(df, "Source: CDM_BATCH_CTRLID")
+
+        # Apply filter for STATUS_RUNNING
+        status_running = self.config.get('status_running', 'RUNNING')
+        df = df.filter(F.col("STATUS") == status_running)
+
+        # Select required columns
+        df = df.select(
+            F.trim(F.col("SOURCE_NAME")).alias("SOURCE_NAME"),
+            F.col("BATCH_ID")
+        )
+
+        logger.info("Data extraction complete")
+        return df
+
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply business transformations.
+
+        Includes:
+        - Aggregation to fetch maximum batch ID per source name.
+        - Lookup enrichment to fetch batch ID for incoming source name.
+        - Null-check logic to replace null batch IDs with -999.
+        """
+        logger.info("Applying transformations")
+
+        # Step 1: Aggregation to fetch maximum batch ID per source name
+        logger.info("Performing aggregation")
+        aggregated_df = df.groupBy("SOURCE_NAME").agg(
+            F.max("BATCH_ID").alias("MAX_BATCH_ID")
+        )
+
+        # Log DataFrame information
+        log_df_info(aggregated_df, "After aggregation")
+
+        # Step 2: Lookup enrichment
+        logger.info("Performing lookup enrichment")
+        lookup_table_name = self.config.get('lookup_table', 'CDM.CDM_BATCH_CTRLID')
+        lookup_local_path = self.config.get('lookup_local_path', None)
+
+        lookup_df = read_table(
+            table_name=lookup_table_name,
+            local_file_path=lookup_local_path
+        ).select(
+            F.trim(F.col("SOURCE_NAME")).alias("SOURCE_NAME"),
+            F.col("BATCH_ID").alias("LKP_BATCH_ID")
+        )
+
+        enriched_df = aggregated_df.join(
+            F.broadcast(lookup_df),
+            aggregated_df.SOURCE_NAME == lookup_df.SOURCE_NAME,
+            "left"
+        ).select(
+            aggregated_df.SOURCE_NAME,
+            F.coalesce(F.col("LKP_BATCH_ID"), F.lit(-999)).alias("o_BATCH_ID")
+        )
+
+        # Log DataFrame information
+        log_df_info(enriched_df, "After lookup enrichment")
+
+        logger.info("Transformations complete")
+        return enriched_df
+
+    def load(self, df: DataFrame):
+        """
+        Load data to target.
+
+        Optimizations:
+        - Delta Lake for ACID compliance.
+        - Partitioning for query performance.
+        """
+        logger.info("Starting data load")
+
+        target_path = self.config.get('target_path', '/path/to/target')
+
+        log_df_info(df, "Before load")
+
+        (df.write
+            .format("delta")
+            .mode(self.config.get('write_mode', 'overwrite'))
+            .partitionBy(*self.config.get('partition_columns', []))
+            .option("overwriteSchema", "true")
+            .save(target_path)
+        )
+
+        # Optimize target table
+        if self.config.get('optimize_target', True):
+            logger.info("Optimizing target table")
+            zorder_cols = self.config.get('zorder_columns', [])
+            if zorder_cols:
+                self.spark.sql(f"""
+                    OPTIMIZE delta.`{target_path}`
+                    ZORDER BY ({', '.join(zorder_cols)})
+                """)
+
+        logger.info("Data load complete")
+
+    def execute(self):
+        """
+        Execute the complete ETL pipeline.
+        """
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+
+        try:
+            # Extract
+            source_df = self.extract()
+
+            # Transform
+            transformed_df = self.transform(source_df)
+
+            # Load
+            self.load(transformed_df)
+
+            logger.info("ETL pipeline completed successfully")
+
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+
+# Configuration
+config = {
+    # Source configuration
+    'source_table': 'CDM.CDM_BATCH_CTRLID',
+    'source_local_path': r'path/to/CDM_BATCH_CTRLID.csv',
+    'status_running': 'RUNNING',
+
+    # Target configuration
+    'target_path': '/path/to/target',
+    'write_mode': 'overwrite',
+    'partition_columns': ['SOURCE_NAME'],
+    'zorder_columns': ['SOURCE_NAME', 'o_BATCH_ID'],
+
+    # Lookup configuration
+    'lookup_table': 'CDM.CDM_BATCH_CTRLID',
+    'lookup_local_path': r'path/to/lookup.csv',
+
+    # Performance configuration
+    'shuffle_partitions': 200,
+    'optimize_target': True
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("CDM_BATCH_ID_Pipeline").getOrCreate()
+    pipeline = CDMBatchIDPipeline(spark, config)
+    pipeline.execute()
+MAPPING FILE: m_CDM_W_CLAIM_CD_SCD3_IU.txt
+====================================================================================================
+
+"""
+ETL Pipeline: m_CDM_W_CLAIM_CD_SCD3_IU
+Migrated from IICS mapping: m_CDM_W_CLAIM_CD_SCD3_IU
+"""
+
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+from typing import Dict
+import logging
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Utility functions
+def read_table(table_name: str, local_file_path: str = None) -> DataFrame:
+    """
+    Read data from catalog (Databricks) or local file based on environment.
+
+    Args:
+        table_name: Full table name in format "catalog.database.table".
+        local_file_path: Local CSV file path for non-Databricks environment.
+
+    Returns:
+        DataFrame from catalog or local file.
+    """
+    is_databricks = 'DATABRICKS_RUNTIME_VERSION' in os.environ
+    if is_databricks:
+        logger.info(f"Reading from catalog: {table_name}")
+        return spark.table(table_name)
+    else:
+        if local_file_path is None:
+            raise Exception(f"Local file path required for {table_name}")
+        logger.info(f"Reading from local file: {local_file_path}")
+        return spark.read.csv(local_file_path, header=True, inferSchema=True)
+
+def log_df_info(df: DataFrame, step_name: str):
+    """
+    Log DataFrame information for debugging.
+
+    Args:
+        df: DataFrame to log.
+        step_name: Description of the step.
+    """
+    try:
+        logger.info(f"{step_name}: {len(df.columns)} columns")
+        logger.info(f"Schema: {[f.name + ':' + str(f.dataType) for f in df.schema.fields]}")
+    except Exception as e:
+        logger.error(f"Error logging DataFrame info: {str(e)}")
+
+class CDMClaimSCD3Pipeline:
+    """
+    ETL Pipeline for processing SCD Type 3 logic for claim data.
+
+    Sources: CDH_GW_BUR
+    Targets: W_CLAIM_CD_BUR_SCD3_U (update operations), W_CLAIM_CD_BUR_SCD3_I (insert operations)
+    Transformation Logic: SCD Type 3 logic with expressions, lookups, and router transformations.
+    """
+
+    def __init__(self, spark: SparkSession, config: Dict):
+        self.spark = spark
+        self.config = config
+        self._configure_spark()
+
+    def _configure_spark(self):
+        """
+        Set Spark configurations for optimal performance.
+        """
+        configs = {
+            "spark.sql.adaptive.enabled": "true",
+            "spark.sql.adaptive.coalescePartitions.enabled": "true",
+            "spark.sql.shuffle.partitions": str(self.config.get('shuffle_partitions', 200))
+        }
+        for key, value in configs.items():
+            self.spark.conf.set(key, value)
+
+    def extract(self) -> DataFrame:
+        """
+        Extract data from source table.
+
+        Returns:
+            Extracted DataFrame.
+        """
+        logger.info("Starting data extraction")
+        table_name = self.config.get('source_table', 'catalog.database.table')
+        local_file_path = self.config.get('source_local_path', None)
+
+        df = read_table(table_name=table_name, local_file_path=local_file_path)
+        log_df_info(df, "Source: CDH_GW_BUR")
+
+        # Apply SQL transformation equivalent
+        df = df.select(
+            F.col("POLICY_STATE"),
+            F.col("BUR"),
+            F.lit("GWCDH").alias("SOURCE_NAME")
+        )
+        logger.info("Data extraction complete")
+        return df
+
+    def transform(self, df: DataFrame) -> DataFrame:
+        """
+        Apply transformations including expressions, lookups, and router logic.
+
+        Args:
+            df: Input DataFrame.
+
+        Returns:
+            Transformed DataFrame.
+        """
+        logger.info("Applying transformations")
+
+        # Step 2: Expression Transformation (EXP_BUR)
+        df = df.select(
+            F.col("POLICY_STATE").alias("INTEGRATION_ID"),
+            F.col("BUR"),
+            F.col("SOURCE_NAME")
+        )
+
+        # Step 3: Lookup Transformation (LKP_W_CLAIM_CD_BUR_SCD3)
+        lookup_table_name = self.config.get('lookup_table', 'catalog.database.lookup_table')
+        lookup_local_path = self.config.get('lookup_local_path', None)
+        lookup_df = read_table(table_name=lookup_table_name, local_file_path=lookup_local_path)
+
+        lookup_df = lookup_df.select(
+            F.col("ROW_WID").alias("LKP_ROW_WID"),
+            F.col("INTEGRATION_ID").alias("LKP_INTEGRATION_ID"),
+            F.col("NEW_BUR").alias("LKP_NEW_BUR")
+        )
+
+        df = df.join(
+            F.broadcast(lookup_df),
+            df.INTEGRATION_ID == lookup_df.LKP_INTEGRATION_ID,
+            "left"
+        )
+
+        # Step 4: Expression Transformation (EXP_Flag)
+        df = df.withColumn(
+            "o_Flag",
+            F.when(F.col("LKP_ROW_WID").isNull(), "I")
+            .when(F.md5(F.col("BUR")) == F.md5(F.col("LKP_NEW_BUR")), "NC")
+            .otherwise("U")
+        ).withColumn(
+            "CDM_INSERT_DT", F.current_timestamp()
+        ).withColumn(
+            "CDM_UPDATE_DT", F.current_timestamp()
+        ).withColumn(
+            "TGT_TABLE_NAME", F.lit("W_CLAIM_CD_BUR_SCD3")
+        )
+
+        # Step 5: Router Transformation (rtr_CLM_INSERT_UPD)
+        insert_df = df.filter(F.col("o_Flag") == "I")
+        update_df = df.filter(F.col("o_Flag") == "U")
+
+        log_df_info(insert_df, "Insert Group")
+        log_df_info(update_df, "Update Group")
+
+        return insert_df, update_df
+
+    def load(self, insert_df: DataFrame, update_df: DataFrame):
+        """
+        Load data to target tables.
+
+        Args:
+            insert_df: DataFrame for insert operations.
+            update_df: DataFrame for update operations.
+        """
+        logger.info("Starting data load")
+
+        # Load insert data
+        insert_target_path = self.config.get('insert_target_path', '/path/to/insert_target')
+        (insert_df.write
+            .format("delta")
+            .mode("append")
+            .save(insert_target_path)
+        )
+
+        # Load update data
+        update_target_path = self.config.get('update_target_path', '/path/to/update_target')
+        (update_df.write
+            .format("delta")
+            .mode("append")
+            .save(update_target_path)
+        )
+
+        logger.info("Data load complete")
+
+    def execute(self):
+        """
+        Execute the complete ETL pipeline.
+        """
+        logger.info(f"Starting ETL pipeline: {self.__class__.__name__}")
+        try:
+            # Extract
+            source_df = self.extract()
+
+            # Transform
+            insert_df, update_df = self.transform(source_df)
+
+            # Load
+            self.load(insert_df, update_df)
+
+            logger.info("ETL pipeline completed successfully")
+        except Exception as e:
+            logger.error(f"ETL pipeline failed: {str(e)}")
+            raise
+
+
+# Configuration
+config = {
+    # Source configuration
+    'source_table': 'CDH_GWODS.CDH_GW_BUR',
+    'source_local_path': r'path/to/CDH_GW_BUR.csv',
+
+    # Lookup configuration
+    'lookup_table': 'CDM.W_CLAIM_CD_BUR_SCD3',
+    'lookup_local_path': r'path/to/lookup.csv',
+
+    # Target configuration
+    'insert_target_path': '/path/to/insert_target',
+    'update_target_path': '/path/to/update_target',
+
+    # Performance configuration
+    'shuffle_partitions': 200
+}
+
+# Execute
+if __name__ == "__main__":
+    spark = SparkSession.builder.appName("ETL_Pipeline").getOrCreate()
+    pipeline = CDMClaimSCD3Pipeline(spark, config)
+    pipeline.execute()
