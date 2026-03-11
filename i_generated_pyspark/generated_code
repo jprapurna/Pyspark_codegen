@@ -137,6 +137,81 @@ def write_to_catalog(df, full_table_name: str, mode: str = "overwrite"):
  
 
 
+def execute_mplt_CDM_BATCH_ID(input_df_from_main):
+    """Execute mapplet mplt_CDM_BATCH_ID"""
+    try:
+        logger.info("=" * 80)
+        logger.info("EXECUTING MAPPLET: mplt_CDM_BATCH_ID")
+        logger.info("=" * 80)
+
+        # ====================================================================
+        # NODE 4: mplti_BATCH_ID (Expression)
+        # Description: This transformation node processes batch IDs by checking for null values
+        #              and outputs the maximum batch ID for the incoming source name.
+        # Depth: 0 | Previous Nodes: [] | Next Nodes: ['36']
+        # ====================================================================
+        df = input_df_from_main.withColumn("SOURCE_NAME", F.col("SOURCE_NAME"))
+        df = df.withColumn("in_SOURCE_NAME", F.col("SOURCE_NAME"))  # Pass-through field
+
+        # ====================================================================
+        # NODE 36: lkp_CDM_BATCH_CTRLID (Lookup)
+        # Description: This transformation performs a lookup on the CDM_BATCH_CTRLID table
+        #              to retrieve the maximum batch ID and trims the source name.
+        # Depth: 1 | Previous Nodes: ['4'] | Next Nodes: ['9']
+        # ====================================================================
+        # Step 1: Read lookup table and rename columns for join
+        lkp_raw = spark.table("genai_demo.iics_migration.lkp_cdm_batch_ctrlid")
+        lkp_df = lkp_raw.select(
+            F.col("SOURCE_NAME").alias("_jk_SOURCE_NAME"),  # join key: _jk_ prefix
+            F.col("BATCH_ID").alias("_out_BATCH_ID")        # output column: _out_ prefix
+        )
+
+        # Step 2: Perform the lookup (LEFT JOIN)
+        df = df.join(
+            F.broadcast(lkp_df),
+            F.col("in_SOURCE_NAME") == F.col("_jk_SOURCE_NAME"),
+            "left"
+        )
+
+        # Step 3: Map lookup output columns to final names
+        df = df.withColumn("LKP_BATCH_ID", F.col("_out_BATCH_ID"))
+        df = df.drop("_jk_SOURCE_NAME", "_out_BATCH_ID")  # Drop temporary columns
+
+        # ====================================================================
+        # NODE 9: exp_NULL_CHECK (Expression)
+        # Description: This transformation node checks for null values in the batch ID field
+        #              and outputs either a default value (-999) or the lookup batch ID value.
+        # Depth: 2 | Previous Nodes: ['36'] | Next Nodes: ['37']
+        # ====================================================================
+        df = df.withColumn(
+            "o_BATCH_ID",
+            F.when(F.col("LKP_BATCH_ID").isNull(), F.lit(-999)).otherwise(F.col("LKP_BATCH_ID"))
+        )
+        df = df.withColumn("SOURCE_NAME", F.col("SOURCE_NAME"))  # Pass-through field
+        df = df.withColumn("IN_TABLE_NAME", F.lit("W_CLAIM_CD_BUR_SCD3"))  # Static value
+
+        # ====================================================================
+        # NODE 37: mplto_BATCH_ID (Mapplet Output)
+        # Description: Mapplet transformation that checks for null batch_id values
+        #              and outputs the maximum batch_id for the incoming source name.
+        # Depth: 3 | Previous Nodes: ['9'] | Next Nodes: []
+        # ====================================================================
+        # Pass-through output field
+        final_df = df.withColumn("o_BATCH_ID", F.col("o_BATCH_ID"))
+
+        # Cleanup: Drop intermediate columns
+        final_df = final_df.drop("LKP_BATCH_ID", "in_SOURCE_NAME")
+
+        logger.info("=" * 80)
+        logger.info("MAPPLET mplt_CDM_BATCH_ID COMPLETED")
+        logger.info("=" * 80)
+        return final_df
+
+    except Exception as e:
+        logger.error(f"Mapplet mplt_CDM_BATCH_ID execution failed: {str(e)}")
+        raise Exception(f"Mapplet mplt_CDM_BATCH_ID failed: {str(e)}")
+
+
 def execute_mplt_CDM_ROW_WID(input_df_from_main):
     """Execute mapplet mplt_CDM_ROW_WID"""
     try:
@@ -175,7 +250,6 @@ def execute_mplt_CDM_ROW_WID(input_df_from_main):
             F.col("TGT_TABLE_NAME") == F.col("_jk_TABLE_NAME"),
             "left"
         )
-
         # Map lookup output columns to final names
         df = df.withColumn("LKP_ROW_WID", F.col("_out_ROW_WID"))
         df = df.drop("_jk_TABLE_NAME", "_out_ROW_WID")  # Drop temporary columns
@@ -185,12 +259,13 @@ def execute_mplt_CDM_ROW_WID(input_df_from_main):
         # Description: Expression transformation to calculate ROW_WID using lookup and conditional logic
         # Depth: 1 | Previous Nodes: ['5'] | Next Nodes: ['10']
         # ====================================================================
-        # Apply expression logic
+        # Add intermediate variables V1 and V2
         df = df.withColumn(
             "V1",
             F.when(F.col("LKP_ROW_WID").isNull(), F.lit(0)).otherwise(F.col("LKP_ROW_WID"))
         )
         df = df.withColumn("V2", F.col("V1") + 1)
+        # Calculate final ROW_WID
         df = df.withColumn("ROW_WID", F.col("V2"))
 
         # ====================================================================
@@ -198,10 +273,10 @@ def execute_mplt_CDM_ROW_WID(input_df_from_main):
         # Description: Output transformation for ROW_WID
         # Depth: 2 | Previous Nodes: ['7'] | Next Nodes: []
         # ====================================================================
-        # Finalise output
+        # Finalise output DataFrame
         final_df = df.select(*input_df_from_main.columns, "ROW_WID")
 
-        # Cleanup intermediate columns
+        # Cleanup: Drop intermediate columns
         final_df = final_df.drop("V1", "V2", "LKP_ROW_WID")
 
         logger.info("=" * 80)
@@ -212,80 +287,6 @@ def execute_mplt_CDM_ROW_WID(input_df_from_main):
     except Exception as e:
         logger.error(f"Mapplet mplt_CDM_ROW_WID execution failed: {str(e)}")
         raise Exception(f"Mapplet mplt_CDM_ROW_WID failed: {str(e)}")
-
-
-def execute_mplt_CDM_BATCH_ID(input_df_from_main):
-    """Execute mapplet mplt_CDM_BATCH_ID"""
-    try:
-        logger.info("=" * 80)
-        logger.info("EXECUTING MAPPLET: mplt_CDM_BATCH_ID")
-        logger.info("=" * 80)
-
-        # ====================================================================
-        # NODE 4: mplti_BATCH_ID (Expression)
-        # Description: This transformation node processes batch IDs by checking for null values
-        # and outputs the maximum batch ID for the incoming source name.
-        # Depth: 0 | Previous Nodes: [] | Next Nodes: ['36']
-        # ====================================================================
-        df = input_df_from_main.withColumn("SOURCE_NAME", F.col("SOURCE_NAME"))
-        df = df.withColumn("in_SOURCE_NAME", F.col("SOURCE_NAME"))  # Pass-through field
-
-        # ====================================================================
-        # NODE 36: lkp_CDM_BATCH_CTRLID (Lookup)
-        # Description: This transformation performs a lookup on the CDM_BATCH_CTRLID table
-        # to retrieve the maximum batch ID and trims the source name.
-        # Depth: 1 | Previous Nodes: ['4'] | Next Nodes: ['9']
-        # ====================================================================
-        lkp_raw = spark.table("genai_demo.iics_migration.lkp_cdm_batch_ctrlid")
-        lkp_df = lkp_raw.select(
-            F.col("SOURCE_NAME").alias("_jk_SOURCE_NAME"),  # Join key: _jk_ prefix
-            F.col("BATCH_ID").alias("_out_BATCH_ID")       # Output column: _out_ prefix
-        )
-
-        df = df.join(
-            F.broadcast(lkp_df),
-            F.col("in_SOURCE_NAME") == F.col("_jk_SOURCE_NAME"),
-            "left"
-        )
-
-        # Map lookup output columns to final names
-        df = df.withColumn("LKP_BATCH_ID", F.col("_out_BATCH_ID"))
-        df = df.drop("_jk_SOURCE_NAME", "_out_BATCH_ID")  # Drop temporary columns
-
-        # ====================================================================
-        # NODE 9: exp_NULL_CHECK (Expression)
-        # Description: This transformation node checks for null values in the batch ID field
-        # and outputs either a default value (-999) or the lookup batch ID value.
-        # Depth: 2 | Previous Nodes: ['36'] | Next Nodes: ['37']
-        # ====================================================================
-        df = df.withColumn(
-            "o_BATCH_ID",
-            F.when(F.col("LKP_BATCH_ID").isNull(), F.lit(-999)).otherwise(F.col("LKP_BATCH_ID"))
-        )
-        df = df.withColumn("SOURCE_NAME", F.col("SOURCE_NAME"))  # Pass-through field
-        df = df.withColumn("IN_TABLE_NAME", F.lit("W_CLAIM_CD_BUR_SCD3"))  # Static value
-
-        # ====================================================================
-        # NODE 37: mplto_BATCH_ID (Mapplet)
-        # Description: Mapplet transformation that checks for null batch_id values
-        # and outputs the maximum batch_id for the incoming source name.
-        # Depth: 3 | Previous Nodes: ['9'] | Next Nodes: []
-        # ====================================================================
-        df = df.withColumn("o_BATCH_ID", F.col("o_BATCH_ID"))  # Pass-through field
-
-        # ====================================================================
-        # CLEANUP: Drop intermediate columns before returning
-        # ====================================================================
-        df = df.drop("LKP_BATCH_ID")  # Drop lookup intermediate column
-
-        logger.info("=" * 80)
-        logger.info("MAPPLET mplt_CDM_BATCH_ID COMPLETED")
-        logger.info("=" * 80)
-        return df
-
-    except Exception as e:
-        logger.error(f"Mapplet mplt_CDM_BATCH_ID execution failed: {str(e)}")
-        raise Exception(f"Mapplet mplt_CDM_BATCH_ID failed: {str(e)}")
 
 
 
@@ -307,7 +308,7 @@ try:
     # Step 1: Read source table from Unity Catalog
     final_df_6 = read_table(
         table_name="genai_demo.iics_migration.sq_cdh_gw_bur",
-        local_file_path=None  # No local file backup provided
+        local_file_path=None  # No local file path provided
     )
 
     # Step 2: Log DataFrame information
@@ -324,10 +325,20 @@ except Exception as e:
 # COMMAND ----------
 
 # ============================================================================
-# BATCH 2/7 - DEPTH 1 - BATCH 1/1 (FIXED - Attempt 1)
+# BATCH 2/7 - DEPTH 1 - BATCH 1/1
 # Nodes: EXP_BUR
 # ============================================================================
 
+# ============================================================================
+# BATCH 2/7 - DEPTH 1 - BATCH 1/1
+# Nodes: EXP_BUR
+# ============================================================================
+
+# ============================================================================
+# NODE 8: EXP_BUR (Expression)
+# Description: Expression transformation for BUR processing
+# Depth: 1 | Previous Nodes: ['6'] | Next Nodes: ['11', '14', '28']
+# ============================================================================
 try:
     logger.info("Processing Node 8: EXP_BUR (Expression)")
 
@@ -335,7 +346,7 @@ try:
     input_df = final_df_6  # From Node 6 (SQ_CDH_GW_BUR)
 
     # Step 2: Apply transformations
-    # Map fields and pass through existing columns
+    # Note: Only reference existing columns or create NULL placeholders for derived fields
     final_df_8 = input_df \
         .withColumn("INTEGRATION_ID", F.col("POLICY_STATE")) \
         .withColumn("BUR", F.col("BUR")) \
@@ -364,6 +375,7 @@ except Exception as e:
 # Nodes: LKP_W_CLAIM_CD_BUR_SCD3, mplt_CDM_BATCH_ID
 # ============================================================================
 
+
 # ============================================================================
 # BATCH 3/7 - DEPTH 2 - BATCH 1/1
 # Nodes: LKP_W_CLAIM_CD_BUR_SCD3, mplt_CDM_BATCH_ID
@@ -371,7 +383,7 @@ except Exception as e:
 
 # ============================================================================
 # NODE 11: LKP_W_CLAIM_CD_BUR_SCD3 (Lookup)
-# Description: Lookup transformation to retrieve BUR and INTEGRATION_ID
+# Description: Lookup transformation for W_CLAIM_CD_BUR_SCD3 table
 # Depth: 2 | Previous Nodes: ['8'] | Next Nodes: ['14']
 # ============================================================================
 try:
@@ -388,22 +400,18 @@ try:
     lookup_table = "genai_demo.iics_migration.lkp_w_claim_cd_bur_scd3"
     lookup_df_raw = read_table(lookup_table, None)
 
-    # Step 4: Select ONLY required columns from lookup table using safe temp prefixes
+    # Step 4: Select ONLY required columns from lookup table
     lookup_df_selected = lookup_df_raw.select(
-        F.col("LKP_INTEGRATION_ID").alias("_jk_INTEGRATION_ID"),
-        F.col("LKP_NEW_BUR").alias("_out_LKP_NEW_BUR"),
-        F.col("LKP_INTEGRATION_ID").alias("_out_LKP_INTEGRATION_ID")
+        F.col("LKP_INTEGRATION_ID").alias("_jk_INTEGRATION_ID"),  # Join key renamed
+        F.col("LKP_NEW_BUR").alias("_out_LKP_NEW_BUR")            # Output column
     )
 
-    # Step 5: Perform left join and overwrite lookup output columns
+    # Step 5: Perform left join, map output, and drop temp columns
     final_df_11 = input_df_clean.join(
         F.broadcast(lookup_df_selected),
-        input_df_clean["INTEGRATION_ID"] == lookup_df_selected["_jk_INTEGRATION_ID"],
+        F.col("INTEGRATION_ID") == F.col("_jk_INTEGRATION_ID"),
         how="left"
-    )
-    final_df_11 = final_df_11.withColumn("LKP_NEW_BUR", F.col("_out_LKP_NEW_BUR"))
-    final_df_11 = final_df_11.withColumn("LKP_INTEGRATION_ID", F.col("_out_LKP_INTEGRATION_ID"))
-    final_df_11 = final_df_11.drop("_jk_INTEGRATION_ID", "_out_LKP_NEW_BUR", "_out_LKP_INTEGRATION_ID")
+    ).withColumn("LKP_NEW_BUR", F.col("_out_LKP_NEW_BUR")).drop("_jk_INTEGRATION_ID", "_out_LKP_NEW_BUR")
 
     # Step 6: Log DataFrame information
     log_df_info(final_df_11, "LKP_W_CLAIM_CD_BUR_SCD3")
@@ -416,7 +424,7 @@ except Exception as e:
 
 # ============================================================================
 # NODE 28: mplt_CDM_BATCH_ID (Mapplet)
-# Description: Mapplet transformation to process batch IDs
+# Description: Mapplet transformation for batch ID processing
 # Depth: 2 | Previous Nodes: ['8'] | Next Nodes: ['14']
 # ============================================================================
 try:
@@ -426,7 +434,7 @@ try:
     input_df = final_df_8  # From Node 8 (EXP_BUR)
 
     # Step 2: Call the mapplet function
-    # CRITICAL: Pass input DataFrame exactly as-is (no renaming or preprocessing)
+    # CRITICAL: Pass input DataFrame exactly as-is (no renaming or pre-processing)
     final_df_28 = execute_mplt_CDM_BATCH_ID(input_df)
 
     # Step 3: Log DataFrame information
@@ -437,6 +445,7 @@ try:
 except Exception as e:
     logger.error(f"✗ Error in Node 28: {str(e)}")
     raise Exception(f"Critical error in Node 28: {str(e)}")
+
 
 
 
@@ -454,18 +463,18 @@ except Exception as e:
 
 # ============================================================================
 # NODE 14: EXP_Flag (Expression)
-# Description: Expression transformation to calculate flags and timestamps
+# Description: Expression transformation for flag processing
 # Depth: 3 | Previous Nodes: ['8', '11', '28'] | Next Nodes: ['33']
 # ============================================================================
 try:
     logger.info("Processing Node 14: EXP_Flag (Expression)")
 
-    # Step 1: Load input DataFrame from previous nodes
+    # Step 1: Load input DataFrame from previous node
     # CRITICAL: Use the output of the most recent node at depth 2 (Node 28)
     input_df = final_df_28  # From Node 28 (mplt_CDM_BATCH_ID)
 
     # Step 2: Apply transformations
-    # Map fields and pass through existing columns
+    # Note: Follow the field mappings provided in the transformation details
     final_df_14 = input_df \
         .withColumn(
             "o_Flag",
@@ -507,7 +516,7 @@ except Exception as e:
 
 # ============================================================================
 # NODE 33: rtr_CLM_INSERT_UPD (Router)
-# Description: Router transformation to split data into INSERT and UPDATE groups
+# Description: Router transformation for INSERT and UPDATE operations
 # Depth: 4 | Previous Nodes: ['14'] | Next Nodes: ['23', '18', '25']
 # ============================================================================
 try:
@@ -516,7 +525,7 @@ try:
     # Step 1: Load input DataFrame from previous node
     input_df = final_df_14  # From Node 14 (EXP_Flag)
 
-    # Step 2: Apply router logic to split data into groups
+    # Step 2: Apply router logic to create separate DataFrames for each group
     # Group: INSERT (o_Flag='I')
     final_df_33_INSERT = input_df.filter(F.col("o_Flag") == "I")
 
@@ -553,28 +562,18 @@ except Exception as e:
 
 # ============================================================================
 # NODE 18: UPD_BUR (Expression)
-# Description: Expression transformation to update strategy
+# Description: Expression transformation for BUR update strategy
 # Depth: 5 | Previous Nodes: ['33'] | Next Nodes: ['20']
 # ============================================================================
 try:
     logger.info("Processing Node 18: UPD_BUR (Expression)")
 
     # Step 1: Load input DataFrame from previous node
-    input_df = final_df_33_UPDATE  # From Node 33 (Router - UPDATE group)
+    input_df = final_df_33_UPDATE  # From Node 33 (Router group: UPDATE)
 
     # Step 2: Apply transformations
-    # Map fields and pass through existing columns
-    final_df_18 = input_df \
-        .withColumn("Update_Strategy_Expression_78066", F.lit("DD_UPDATE")) \
-        .withColumn("BUR", F.col("BUR")) \
-        .withColumn("SOURCE_NAME", F.col("SOURCE_NAME")) \
-        .withColumn("o_Flag", F.col("o_Flag")) \
-        .withColumn("CDM_INSERT_DT", F.col("CDM_INSERT_DT")) \
-        .withColumn("CDM_UPDATE_DT", F.col("CDM_UPDATE_DT")) \
-        .withColumn("TGT_TABLE_NAME", F.col("TGT_TABLE_NAME")) \
-        .withColumn("LKP_INTEGRATION_ID", F.col("LKP_INTEGRATION_ID")) \
-        .withColumn("in_INTEGRATION_ID", F.col("in_INTEGRATION_ID")) \
-        .withColumn("BATCH_ID", F.col("BATCH_ID"))
+    # Note: Update_Strategy_Expression_78066 is mapped directly to DD_UPDATE
+    final_df_18 = input_df.withColumn("Update_Strategy_Expression_78066", F.lit("DD_UPDATE"))
 
     # Step 3: Log DataFrame information
     log_df_info(final_df_18, "UPD_BUR")
@@ -587,17 +586,17 @@ except Exception as e:
 
 # ============================================================================
 # NODE 23: mplt_CDM_ROW_WID (Mapplet)
-# Description: Mapplet transformation to process ROW_WID
+# Description: Mapplet transformation for ROW_WID processing
 # Depth: 5 | Previous Nodes: ['33'] | Next Nodes: ['25']
 # ============================================================================
 try:
     logger.info("Processing Node 23: mplt_CDM_ROW_WID (Mapplet)")
 
     # Step 1: Load input DataFrame from previous node
-    input_df = final_df_33_INSERT  # From Node 33 (Router - INSERT group)
+    input_df = final_df_33_INSERT  # From Node 33 (Router group: INSERT)
 
     # Step 2: Call the mapplet function
-    # CRITICAL: Pass input DataFrame exactly as-is (no renaming or preprocessing)
+    # CRITICAL: Pass input DataFrame exactly as-is (no renaming or pre-processing)
     final_df_23 = execute_mplt_CDM_ROW_WID(input_df)
 
     # Step 3: Log DataFrame information
@@ -629,7 +628,7 @@ except Exception as e:
 # Depth: 6 | Previous Nodes: ['23', '33'] | Next Nodes: []
 # ============================================================================
 try:
-    logger.info("Processing Node 25: W_CLAIM_CD_BUR_SCD3_I (Output - Insert)")
+    logger.info("Processing Node 25: W_CLAIM_CD_BUR_SCD3_I (Output)")
 
     # Step 1: Load input DataFrame from previous node
     input_df = final_df_23  # From Node 23 (mplt_CDM_ROW_WID)
@@ -655,10 +654,10 @@ try:
     if cols_to_drop:
         cleaned_df = cleaned_df.drop(*cols_to_drop)
 
-    # Step 4: Add active_flag columns based on Jira ticket
-    # CRITICAL: active_flag = "Y" (hardcoded)
-    cleaned_df = cleaned_df.withColumn("IS_ACTIVE", F.lit(1))
-    cleaned_df = cleaned_df.withColumn("END_DATE", F.lit(None).cast("date"))
+    # Step 4: Add active_flag business rule columns
+    # CRITICAL: active_flag = "N" (hardcoded)
+    cleaned_df = cleaned_df.withColumn("IS_ACTIVE", F.lit(0)) \
+                           .withColumn("END_DATE", F.current_date())
 
     # Step 5: Determine target table name
     target_table = "genai_demo.iics_migration.w_claim_cd_bur_scd3_insert"
@@ -684,7 +683,7 @@ except Exception as e:
 # Depth: 6 | Previous Nodes: ['18'] | Next Nodes: []
 # ============================================================================
 try:
-    logger.info("Processing Node 20: W_CLAIM_CD_BUR_SCD3_U (Output - Update)")
+    logger.info("Processing Node 20: W_CLAIM_CD_BUR_SCD3_U (Output)")
 
     # Step 1: Load input DataFrame from previous node
     input_df = final_df_18  # From Node 18 (UPD_BUR)
@@ -710,10 +709,10 @@ try:
     if cols_to_drop:
         cleaned_df = cleaned_df.drop(*cols_to_drop)
 
-    # Step 4: Add active_flag columns based on Jira ticket
-    # CRITICAL: active_flag = "Y" (hardcoded)
-    cleaned_df = cleaned_df.withColumn("IS_ACTIVE", F.lit(1))
-    cleaned_df = cleaned_df.withColumn("END_DATE", F.lit(None).cast("date"))
+    # Step 4: Add active_flag business rule columns
+    # CRITICAL: active_flag = "N" (hardcoded)
+    cleaned_df = cleaned_df.withColumn("IS_ACTIVE", F.lit(0)) \
+                           .withColumn("END_DATE", F.current_date())
 
     # Step 5: Determine target table name
     target_table = "genai_demo.iics_migration.w_claim_cd_bur_scd3_update"
@@ -744,9 +743,6 @@ from datetime import date
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DateType
 
-unit_results = []
-func_results = []
-
 original_spark_table = spark.table
 mock_tables = {}
 
@@ -754,6 +750,11 @@ def mock_spark_table(name):
     if name in mock_tables:
         return mock_tables[name]
     raise Exception(f"Mock table not found: {name}")
+
+spark.table = mock_spark_table
+
+unit_results = []
+func_results = []
 
 def apply_exp_flag(df):
     return df.withColumn(
@@ -765,643 +766,642 @@ def apply_exp_flag(df):
          )
     )
 
-spark.table = mock_spark_table
-
 try:
-    # Mock lookup tables
-    lkp_max_row_wid_schema = StructType([
+    # Mock tables setup
+    schema_lkp_max_row_wid = StructType([
         StructField("TABLE_NAME", StringType(), True),
         StructField("ROW_WID", IntegerType(), True)
     ])
-    lkp_max_row_wid_data = [
+    lkp_max_row_wid_rows = [
         ("W_CLAIM_CD_BUR_SCD3", 5),
-        ("W_CLAIM_CD_BUR_SCD3_LARGE", 9999)
+        ("BIG_TABLE", 9999)
     ]
-    mock_tables["genai_demo.iics_migration.lkp_max_row_wid"] = spark.createDataFrame(
-        lkp_max_row_wid_data, lkp_max_row_wid_schema
-    )
+    mock_tables["genai_demo.iics_migration.lkp_max_row_wid"] = spark.createDataFrame(lkp_max_row_wid_rows, schema_lkp_max_row_wid)
 
-    lkp_batch_ctrl_schema = StructType([
+    schema_lkp_batch = StructType([
         StructField("SOURCE_NAME", StringType(), True),
         StructField("BATCH_ID", IntegerType(), True)
     ])
-    lkp_batch_ctrl_data = [
-        ("SRC_HIT", 123),
+    lkp_batch_rows = [
+        ("SRC1", 77),
         ("SRC_NEG", -1)
     ]
-    mock_tables["genai_demo.iics_migration.lkp_cdm_batch_ctrlid"] = spark.createDataFrame(
-        lkp_batch_ctrl_data, lkp_batch_ctrl_schema
-    )
+    mock_tables["genai_demo.iics_migration.lkp_cdm_batch_ctrlid"] = spark.createDataFrame(lkp_batch_rows, schema_lkp_batch)
 
-    # Shared actions setup
-    row_wid_rows = []
-    row_wid_cols = []
-    row_wid_error = None
+    # UT_001 and UT_004 reuse
     try:
-        row_wid_input_schema = StructType([
+        schema_ut_row_wid = StructType([StructField("TGT_TABLE_NAME", StringType(), True)])
+        ut1_input_df = spark.createDataFrame([("W_CLAIM_CD_BUR_SCD3",)], schema_ut_row_wid)
+        ut1_output_df = execute_mplt_CDM_ROW_WID(ut1_input_df)
+        ut1_rows = ut1_output_df.collect()
+        assert ut1_rows[0]["ROW_WID"] == 6
+        unit_results.append({"suite": "UNIT", "name": "UT_001 – execute_mplt_CDM_ROW_WID: lookup HIT → ROW_WID increments correctly", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_001 – execute_mplt_CDM_ROW_WID: lookup HIT → ROW_WID increments correctly", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_001 – execute_mplt_CDM_ROW_WID: lookup HIT → ROW_WID increments correctly", "status": "ERROR", "message": str(e)})
+
+    try:
+        assert "LKP_ROW_WID" not in ut1_output_df.columns and "V1" not in ut1_output_df.columns and "V2" not in ut1_output_df.columns
+        unit_results.append({"suite": "UNIT", "name": "UT_004 – execute_mplt_CDM_ROW_WID: intermediate columns LKP_ROW_WID/V1/V2 NOT in output", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_004 – execute_mplt_CDM_ROW_WID: intermediate columns LKP_ROW_WID/V1/V2 NOT in output", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_004 – execute_mplt_CDM_ROW_WID: intermediate columns LKP_ROW_WID/V1/V2 NOT in output", "status": "ERROR", "message": str(e)})
+
+    # UT_002
+    try:
+        ut2_input_df = spark.createDataFrame([("MISSING_TABLE",)], schema_ut_row_wid)
+        ut2_output_df = execute_mplt_CDM_ROW_WID(ut2_input_df)
+        ut2_rows = ut2_output_df.collect()
+        assert ut2_rows[0]["ROW_WID"] == 1
+        unit_results.append({"suite": "UNIT", "name": "UT_002 – execute_mplt_CDM_ROW_WID: lookup MISS → ROW_WID defaults to 1", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_002 – execute_mplt_CDM_ROW_WID: lookup MISS → ROW_WID defaults to 1", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_002 – execute_mplt_CDM_ROW_WID: lookup MISS → ROW_WID defaults to 1", "status": "ERROR", "message": str(e)})
+
+    # UT_003
+    try:
+        ut3_input_df = spark.createDataFrame([("BIG_TABLE",)], schema_ut_row_wid)
+        ut3_output_df = execute_mplt_CDM_ROW_WID(ut3_input_df)
+        ut3_rows = ut3_output_df.collect()
+        assert ut3_rows[0]["ROW_WID"] == 10000
+        unit_results.append({"suite": "UNIT", "name": "UT_003 – execute_mplt_CDM_ROW_WID: large ROW_WID (9999) → increments to 10000", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_003 – execute_mplt_CDM_ROW_WID: large ROW_WID (9999) → increments to 10000", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_003 – execute_mplt_CDM_ROW_WID: large ROW_WID (9999) → increments to 10000", "status": "ERROR", "message": str(e)})
+
+    # UT_005 and UT_008 reuse
+    try:
+        schema_ut_batch = StructType([StructField("SOURCE_NAME", StringType(), True)])
+        ut5_input_df = spark.createDataFrame([("SRC1",)], schema_ut_batch)
+        ut5_output_df = execute_mplt_CDM_BATCH_ID(ut5_input_df)
+        ut5_rows = ut5_output_df.collect()
+        assert ut5_rows[0]["o_BATCH_ID"] == 77
+        unit_results.append({"suite": "UNIT", "name": "UT_005 – execute_mplt_CDM_BATCH_ID: lookup HIT → o_BATCH_ID == lookup value", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_005 – execute_mplt_CDM_BATCH_ID: lookup HIT → o_BATCH_ID == lookup value", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_005 – execute_mplt_CDM_BATCH_ID: lookup HIT → o_BATCH_ID == lookup value", "status": "ERROR", "message": str(e)})
+
+    try:
+        assert ut5_rows[0]["IN_TABLE_NAME"] == "W_CLAIM_CD_BUR_SCD3"
+        unit_results.append({"suite": "UNIT", "name": "UT_008 – execute_mplt_CDM_BATCH_ID: IN_TABLE_NAME constant == 'W_CLAIM_CD_BUR_SCD3'", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_008 – execute_mplt_CDM_BATCH_ID: IN_TABLE_NAME constant == 'W_CLAIM_CD_BUR_SCD3'", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_008 – execute_mplt_CDM_BATCH_ID: IN_TABLE_NAME constant == 'W_CLAIM_CD_BUR_SCD3'", "status": "ERROR", "message": str(e)})
+
+    # UT_006
+    try:
+        ut6_input_df = spark.createDataFrame([("SRC_MISS",)], schema_ut_batch)
+        ut6_output_df = execute_mplt_CDM_BATCH_ID(ut6_input_df)
+        ut6_rows = ut6_output_df.collect()
+        assert ut6_rows[0]["o_BATCH_ID"] == -999
+        unit_results.append({"suite": "UNIT", "name": "UT_006 – execute_mplt_CDM_BATCH_ID: lookup MISS → o_BATCH_ID == -999", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_006 – execute_mplt_CDM_BATCH_ID: lookup MISS → o_BATCH_ID == -999", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_006 – execute_mplt_CDM_BATCH_ID: lookup MISS → o_BATCH_ID == -999", "status": "ERROR", "message": str(e)})
+
+    # UT_007
+    try:
+        ut7_input_df = spark.createDataFrame([("SRC_NEG",)], schema_ut_batch)
+        ut7_output_df = execute_mplt_CDM_BATCH_ID(ut7_input_df)
+        ut7_rows = ut7_output_df.collect()
+        assert ut7_rows[0]["o_BATCH_ID"] == -1
+        unit_results.append({"suite": "UNIT", "name": "UT_007 – execute_mplt_CDM_BATCH_ID: negative BATCH_ID (-1) passed through as -1 not -999", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_007 – execute_mplt_CDM_BATCH_ID: negative BATCH_ID (-1) passed through as -1 not -999", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_007 – execute_mplt_CDM_BATCH_ID: negative BATCH_ID (-1) passed through as -1 not -999", "status": "ERROR", "message": str(e)})
+
+    # UT_009 - multi-row apply_exp_flag, collect once
+    schema_ut9 = StructType([
+        StructField("ID", IntegerType(), True),
+        StructField("LKP_ROW_WID", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("LKP_NEW_BUR", StringType(), True)
+    ])
+    ut9_rows_data = [
+        (1, None, "A", "A"),
+        (2, "1", "A", "A"),
+        (3, "2", "A", "B")
+    ]
+    ut9_df = spark.createDataFrame(ut9_rows_data, schema_ut9)
+    ut9_flag_df = apply_exp_flag(ut9_df)
+    ut9_rows = ut9_flag_df.collect()
+    ut9_map = {r["ID"]: r["o_Flag"] for r in ut9_rows}
+
+    try:
+        assert ut9_map.get(1) == "I"
+        unit_results.append({"suite": "UNIT", "name": "UT_009 – EXP_Flag: NULL LKP_ROW_WID → o_Flag == 'I'", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_009 – EXP_Flag: NULL LKP_ROW_WID → o_Flag == 'I'", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_009 – EXP_Flag: NULL LKP_ROW_WID → o_Flag == 'I'", "status": "ERROR", "message": str(e)})
+
+    try:
+        assert ut9_map.get(2) == "NC"
+        unit_results.append({"suite": "UNIT", "name": "UT_009 – EXP_Flag: BUR match → o_Flag == 'NC'", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_009 – EXP_Flag: BUR match → o_Flag == 'NC'", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_009 – EXP_Flag: BUR match → o_Flag == 'NC'", "status": "ERROR", "message": str(e)})
+
+    try:
+        assert ut9_map.get(3) == "U"
+        unit_results.append({"suite": "UNIT", "name": "UT_009 – EXP_Flag: BUR mismatch → o_Flag == 'U'", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_009 – EXP_Flag: BUR mismatch → o_Flag == 'U'", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_009 – EXP_Flag: BUR mismatch → o_Flag == 'U'", "status": "ERROR", "message": str(e)})
+
+    # UT_010
+    try:
+        schema_ut10 = StructType([
+            StructField("LKP_ROW_WID", StringType(), True),
+            StructField("BUR", StringType(), True),
+            StructField("LKP_NEW_BUR", StringType(), True)
+        ])
+        ut10_df = spark.createDataFrame([( "1", " ", "" )], schema_ut10)
+        ut10_flag_df = apply_exp_flag(ut10_df)
+        ut10_rows = ut10_flag_df.collect()
+        assert ut10_rows[0]["o_Flag"] == "U"
+        unit_results.append({"suite": "UNIT", "name": "UT_010 – EXP_Flag: BUR=' ', LKP_NEW_BUR='' → md5 differs → o_Flag == 'U'", "status": "PASS", "message": ""})
+    except AssertionError as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_010 – EXP_Flag: BUR=' ', LKP_NEW_BUR='' → md5 differs → o_Flag == 'U'", "status": "FAIL", "message": str(e)})
+    except Exception as e:
+        unit_results.append({"suite": "UNIT", "name": "UT_010 – EXP_Flag: BUR=' ', LKP_NEW_BUR='' → md5 differs → o_Flag == 'U'", "status": "ERROR", "message": str(e)})
+
+    # Functional Tests FT_001-FT_004 and FT_011 (reuse same actions)
+    schema_ft_active = StructType([
+        StructField("ACTIVE_FLAG", StringType(), True),
+        StructField("IS_ACTIVE", IntegerType(), True),
+        StructField("END_DATE", DateType(), True)
+    ])
+    ft_active_rows = [
+        ("N", 0, None),
+        ("N", 1, None)
+    ]
+    ft_active_df = spark.createDataFrame(ft_active_rows, schema_ft_active)
+    ft_active_filtered = ft_active_df.filter(F.col("IS_ACTIVE") == 0)
+    ft_active_transformed = ft_active_filtered \
+        .withColumn("IS_ACTIVE", F.when(F.col("ACTIVE_FLAG") == "N", F.lit(0)).otherwise(F.col("IS_ACTIVE"))) \
+        .withColumn("END_DATE", F.when(F.col("ACTIVE_FLAG") == "N", F.current_date()).otherwise(F.col("END_DATE"))) \
+        .cache()
+    ft_active_rows_out = ft_active_transformed.collect()
+    ft_active_count = ft_active_transformed.count()
+
+    try:
+        actual_is_active = ft_active_rows_out[0]["IS_ACTIVE"]
+        assert actual_is_active == 0
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_001",
+            "test_scenario": "ACTIVE_FLAG='N': apply IS_ACTIVE=0 logic",
+            "input_data": str(ft_active_rows),
+            "expected_result": "IS_ACTIVE=0",
+            "actual_result": f"IS_ACTIVE={actual_is_active}",
+            "status": "PASS",
+            "message": ""
+        })
+    except AssertionError as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_001",
+            "test_scenario": "ACTIVE_FLAG='N': apply IS_ACTIVE=0 logic",
+            "input_data": str(ft_active_rows),
+            "expected_result": "IS_ACTIVE=0",
+            "actual_result": f"IS_ACTIVE={actual_is_active}",
+            "status": "FAIL",
+            "message": str(e)
+        })
+    except Exception as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_001",
+            "test_scenario": "ACTIVE_FLAG='N': apply IS_ACTIVE=0 logic",
+            "input_data": str(ft_active_rows),
+            "expected_result": "IS_ACTIVE=0",
+            "actual_result": "ERROR",
+            "status": "ERROR",
+            "message": str(e)
+        })
+
+    try:
+        actual_end_date = ft_active_rows_out[0]["END_DATE"]
+        assert actual_end_date == date.today()
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_002",
+            "test_scenario": "ACTIVE_FLAG='N': apply END_DATE=current_date() logic",
+            "input_data": str(ft_active_rows),
+            "expected_result": f"END_DATE={date.today()}",
+            "actual_result": f"END_DATE={actual_end_date}",
+            "status": "PASS",
+            "message": ""
+        })
+    except AssertionError as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_002",
+            "test_scenario": "ACTIVE_FLAG='N': apply END_DATE=current_date() logic",
+            "input_data": str(ft_active_rows),
+            "expected_result": f"END_DATE={date.today()}",
+            "actual_result": f"END_DATE={actual_end_date}",
+            "status": "FAIL",
+            "message": str(e)
+        })
+    except Exception as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_002",
+            "test_scenario": "ACTIVE_FLAG='N': apply END_DATE=current_date() logic",
+            "input_data": str(ft_active_rows),
+            "expected_result": f"END_DATE={date.today()}",
+            "actual_result": "ERROR",
+            "status": "ERROR",
+            "message": str(e)
+        })
+
+    try:
+        assert ft_active_count == 1
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_003",
+            "test_scenario": "ACTIVE_FLAG='N': record not physically deleted",
+            "input_data": str(ft_active_rows),
+            "expected_result": "count=1",
+            "actual_result": f"count={ft_active_count}",
+            "status": "PASS",
+            "message": ""
+        })
+    except AssertionError as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_003",
+            "test_scenario": "ACTIVE_FLAG='N': record not physically deleted",
+            "input_data": str(ft_active_rows),
+            "expected_result": "count=1",
+            "actual_result": f"count={ft_active_count}",
+            "status": "FAIL",
+            "message": str(e)
+        })
+    except Exception as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_003",
+            "test_scenario": "ACTIVE_FLAG='N': record not physically deleted",
+            "input_data": str(ft_active_rows),
+            "expected_result": "count=1",
+            "actual_result": "ERROR",
+            "status": "ERROR",
+            "message": str(e)
+        })
+
+    try:
+        all_inactive = all(r["IS_ACTIVE"] == 0 for r in ft_active_rows_out)
+        assert all_inactive and ft_active_count == 1
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_011",
+            "test_scenario": "Filter records where IS_ACTIVE=0 for inactive processing",
+            "input_data": str(ft_active_rows),
+            "expected_result": "Only IS_ACTIVE=0 rows retained",
+            "actual_result": f"rows={ft_active_rows_out}",
+            "status": "PASS",
+            "message": ""
+        })
+    except AssertionError as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_011",
+            "test_scenario": "Filter records where IS_ACTIVE=0 for inactive processing",
+            "input_data": str(ft_active_rows),
+            "expected_result": "Only IS_ACTIVE=0 rows retained",
+            "actual_result": f"rows={ft_active_rows_out}",
+            "status": "FAIL",
+            "message": str(e)
+        })
+    except Exception as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_011",
+            "test_scenario": "Filter records where IS_ACTIVE=0 for inactive processing",
+            "input_data": str(ft_active_rows),
+            "expected_result": "Only IS_ACTIVE=0 rows retained",
+            "actual_result": "ERROR",
+            "status": "ERROR",
+            "message": str(e)
+        })
+
+    # FT_004 Reactivation
+    try:
+        ft4_df = spark.createDataFrame([("Y", 0, date(2020, 1, 1))], schema_ft_active)
+        ft4_transformed = ft4_df \
+            .withColumn("IS_ACTIVE", F.when(F.col("ACTIVE_FLAG") == "Y", F.lit(1)).otherwise(F.col("IS_ACTIVE"))) \
+            .withColumn("END_DATE", F.when(F.col("ACTIVE_FLAG") == "Y", F.lit(None).cast(DateType())).otherwise(F.col("END_DATE")))
+        ft4_rows = ft4_transformed.collect()
+        actual_is_active = ft4_rows[0]["IS_ACTIVE"]
+        actual_end_date = ft4_rows[0]["END_DATE"]
+        assert actual_is_active == 1 and actual_end_date is None
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_004",
+            "test_scenario": "ACTIVE_FLAG='Y' reactivation: IS_ACTIVE=1, END_DATE=None",
+            "input_data": str([("Y", 0, date(2020, 1, 1))]),
+            "expected_result": "IS_ACTIVE=1, END_DATE=None",
+            "actual_result": f"IS_ACTIVE={actual_is_active}, END_DATE={actual_end_date}",
+            "status": "PASS",
+            "message": ""
+        })
+    except AssertionError as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_004",
+            "test_scenario": "ACTIVE_FLAG='Y' reactivation: IS_ACTIVE=1, END_DATE=None",
+            "input_data": str([("Y", 0, date(2020, 1, 1))]),
+            "expected_result": "IS_ACTIVE=1, END_DATE=None",
+            "actual_result": f"IS_ACTIVE={actual_is_active}, END_DATE={actual_end_date}",
+            "status": "FAIL",
+            "message": str(e)
+        })
+    except Exception as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_004",
+            "test_scenario": "ACTIVE_FLAG='Y' reactivation: IS_ACTIVE=1, END_DATE=None",
+            "input_data": str([("Y", 0, date(2020, 1, 1))]),
+            "expected_result": "IS_ACTIVE=1, END_DATE=None",
+            "actual_result": "ERROR",
+            "status": "ERROR",
+            "message": str(e)
+        })
+
+    # FT_005 New record → INSERT group, ROW_WID incremented
+    try:
+        schema_ft5 = StructType([
+            StructField("LKP_ROW_WID", StringType(), True),
+            StructField("BUR", StringType(), True),
+            StructField("LKP_NEW_BUR", StringType(), True),
             StructField("TGT_TABLE_NAME", StringType(), True)
         ])
-        row_wid_input_data = [
-            ("W_CLAIM_CD_BUR_SCD3",),
-            ("MISS_TABLE",),
-            ("W_CLAIM_CD_BUR_SCD3_LARGE",)
-        ]
-        row_wid_input_df = spark.createDataFrame(row_wid_input_data, row_wid_input_schema)
-        row_wid_df = execute_mplt_CDM_ROW_WID(row_wid_input_df)
-        row_wid_df.cache()
-        row_wid_rows = row_wid_df.collect()
-        row_wid_cols = row_wid_df.columns
-    except Exception as e:
-        row_wid_error = str(e)
-
-    batch_id_rows = []
-    batch_id_error = None
-    try:
-        batch_id_input_schema = StructType([
-            StructField("SOURCE_NAME", StringType(), True)
-        ])
-        batch_id_input_data = [
-            ("SRC_HIT",),
-            ("SRC_MISS",),
-            ("SRC_NEG",)
-        ]
-        batch_id_input_df = spark.createDataFrame(batch_id_input_data, batch_id_input_schema)
-        batch_id_df = execute_mplt_CDM_BATCH_ID(batch_id_input_df)
-        batch_id_df.cache()
-        batch_id_rows = batch_id_df.collect()
-    except Exception as e:
-        batch_id_error = str(e)
-
-    exp_flag_rows = []
-    exp_flag_error = None
-    try:
-        exp_flag_schema = StructType([
-            StructField("LKP_ROW_WID", StringType(), True),
-            StructField("BUR", StringType(), True),
-            StructField("LKP_NEW_BUR", StringType(), True)
-        ])
-        exp_flag_data = [
-            (None, "A", "B"),
-            ("1", "X", "X"),
-            ("2", "C", "D"),
-            ("3", " ", "")
-        ]
-        exp_flag_input_df = spark.createDataFrame(exp_flag_data, exp_flag_schema)
-        exp_flag_df = apply_exp_flag(exp_flag_input_df).cache()
-        exp_flag_rows = exp_flag_df.collect()
-    except Exception as e:
-        exp_flag_error = str(e)
-
-    active_flag_rows = []
-    active_flag_error = None
-    try:
-        active_flag_schema = StructType([
-            StructField("ACTIVE_FLAG", StringType(), True)
-        ])
-        active_flag_data = [
-            ("N",),
-            ("Y",)
-        ]
-        active_flag_input_df = spark.createDataFrame(active_flag_data, active_flag_schema)
-        active_flag_df = active_flag_input_df.withColumn(
-            "IS_ACTIVE",
-            F.when(F.col("ACTIVE_FLAG") == "N", F.lit(0)).otherwise(F.lit(1))
-        ).withColumn(
-            "END_DATE",
-            F.when(F.col("ACTIVE_FLAG") == "N", F.current_date()).otherwise(F.lit(None).cast(DateType()))
-        )
-        active_flag_rows = active_flag_df.collect()
-    except Exception as e:
-        active_flag_error = str(e)
-
-    filter_rows = []
-    filter_error = None
-    try:
-        filter_schema = StructType([
-            StructField("IS_ACTIVE", IntegerType(), True),
-            StructField("END_DATE", DateType(), True)
-        ])
-        filter_data = [
-            (1, None),
-            (0, None),
-            (1, date(2025, 1, 1))
-        ]
-        filter_input_df = spark.createDataFrame(filter_data, filter_schema)
-        filtered_df = filter_input_df.filter((F.col("IS_ACTIVE") == 1) & (F.col("END_DATE").isNull()))
-        filtered_df.cache()
-        filter_rows = filtered_df.collect()
-    except Exception as e:
-        filter_error = str(e)
-
-    ft5_rows = []
-    ft5_error = None
-    try:
-        ft5_schema = StructType([
-            StructField("TGT_TABLE_NAME", StringType(), True),
-            StructField("LKP_ROW_WID", StringType(), True),
-            StructField("BUR", StringType(), True),
-            StructField("LKP_NEW_BUR", StringType(), True)
-        ])
-        ft5_data = [
-            ("W_CLAIM_CD_BUR_SCD3", None, "A", "B")
-        ]
-        ft5_input_df = spark.createDataFrame(ft5_data, ft5_schema)
-        ft5_flag_df = apply_exp_flag(ft5_input_df)
-        ft5_insert_df = ft5_flag_df.filter(F.col("o_Flag") == "I")
-        ft5_final_df = execute_mplt_CDM_ROW_WID(ft5_insert_df)
-        ft5_rows = ft5_final_df.collect()
-    except Exception as e:
-        ft5_error = str(e)
-
-    mixed_rows = []
-    mixed_error = None
-    try:
-        mixed_schema = StructType([
-            StructField("LKP_ROW_WID", StringType(), True),
-            StructField("BUR", StringType(), True),
-            StructField("LKP_NEW_BUR", StringType(), True)
-        ])
-        mixed_data = [
-            (None, "A", "B"),
-            ("10", "X", "X"),
-            ("11", "Y", "Z")
-        ]
-        mixed_input_df = spark.createDataFrame(mixed_data, mixed_schema)
-        mixed_df = apply_exp_flag(mixed_input_df).withColumn(
-            "Update_Strategy_Expression_78066",
-            F.when(F.col("o_Flag") == "U", F.lit("DD_UPDATE"))
-        ).cache()
-        mixed_rows = mixed_df.collect()
-    except Exception as e:
-        mixed_error = str(e)
-
-    # Unit Tests
-    try:
-        if row_wid_error:
-            raise Exception(row_wid_error)
-        row = next((r for r in row_wid_rows if r["TGT_TABLE_NAME"] == "W_CLAIM_CD_BUR_SCD3"), None)
-        status = "PASS" if row and row["ROW_WID"] == 6 else "FAIL"
-        message = f"Expected ROW_WID=6, Actual={row['ROW_WID'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_001 – execute_mplt_CDM_ROW_WID HIT increments", "status": status, "message": message})
-
-    try:
-        if row_wid_error:
-            raise Exception(row_wid_error)
-        row = next((r for r in row_wid_rows if r["TGT_TABLE_NAME"] == "MISS_TABLE"), None)
-        status = "PASS" if row and row["ROW_WID"] == 1 else "FAIL"
-        message = f"Expected ROW_WID=1, Actual={row['ROW_WID'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_002 – execute_mplt_CDM_ROW_WID MISS defaults to 1", "status": status, "message": message})
-
-    try:
-        if row_wid_error:
-            raise Exception(row_wid_error)
-        row = next((r for r in row_wid_rows if r["TGT_TABLE_NAME"] == "W_CLAIM_CD_BUR_SCD3_LARGE"), None)
-        status = "PASS" if row and row["ROW_WID"] == 10000 else "FAIL"
-        message = f"Expected ROW_WID=10000, Actual={row['ROW_WID'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_003 – execute_mplt_CDM_ROW_WID large increments", "status": status, "message": message})
-
-    try:
-        if row_wid_error:
-            raise Exception(row_wid_error)
-        unwanted = any(col in row_wid_cols for col in ["LKP_ROW_WID", "V1", "V2"])
-        status = "PASS" if not unwanted else "FAIL"
-        message = f"Unwanted columns present: {unwanted}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_004 – execute_mplt_CDM_ROW_WID intermediate columns dropped", "status": status, "message": message})
-
-    try:
-        if batch_id_error:
-            raise Exception(batch_id_error)
-        row = next((r for r in batch_id_rows if r["SOURCE_NAME"] == "SRC_HIT"), None)
-        status = "PASS" if row and row["o_BATCH_ID"] == 123 else "FAIL"
-        message = f"Expected o_BATCH_ID=123, Actual={row['o_BATCH_ID'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_005 – execute_mplt_CDM_BATCH_ID HIT", "status": status, "message": message})
-
-    try:
-        if batch_id_error:
-            raise Exception(batch_id_error)
-        row = next((r for r in batch_id_rows if r["SOURCE_NAME"] == "SRC_MISS"), None)
-        status = "PASS" if row and row["o_BATCH_ID"] == -999 else "FAIL"
-        message = f"Expected o_BATCH_ID=-999, Actual={row['o_BATCH_ID'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_006 – execute_mplt_CDM_BATCH_ID MISS defaults to -999", "status": status, "message": message})
-
-    try:
-        if batch_id_error:
-            raise Exception(batch_id_error)
-        row = next((r for r in batch_id_rows if r["SOURCE_NAME"] == "SRC_NEG"), None)
-        status = "PASS" if row and row["o_BATCH_ID"] == -1 else "FAIL"
-        message = f"Expected o_BATCH_ID=-1, Actual={row['o_BATCH_ID'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_007 – execute_mplt_CDM_BATCH_ID negative passes through", "status": status, "message": message})
-
-    try:
-        if batch_id_error:
-            raise Exception(batch_id_error)
-        row = next((r for r in batch_id_rows if r["SOURCE_NAME"] == "SRC_HIT"), None)
-        status = "PASS" if row and row["IN_TABLE_NAME"] == "W_CLAIM_CD_BUR_SCD3" else "FAIL"
-        message = f"Expected IN_TABLE_NAME=W_CLAIM_CD_BUR_SCD3, Actual={row['IN_TABLE_NAME'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_008 – execute_mplt_CDM_BATCH_ID IN_TABLE_NAME constant", "status": status, "message": message})
-
-    try:
-        if exp_flag_error:
-            raise Exception(exp_flag_error)
-        row = next((r for r in exp_flag_rows if r["LKP_ROW_WID"] is None), None)
-        status = "PASS" if row and row["o_Flag"] == "I" else "FAIL"
-        message = f"Expected o_Flag=I, Actual={row['o_Flag'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_009 – EXP_Flag NULL -> I", "status": status, "message": message})
-
-    try:
-        if exp_flag_error:
-            raise Exception(exp_flag_error)
-        row = next((r for r in exp_flag_rows if r["LKP_ROW_WID"] == "1"), None)
-        status = "PASS" if row and row["o_Flag"] == "NC" else "FAIL"
-        message = f"Expected o_Flag=NC, Actual={row['o_Flag'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_009 – EXP_Flag match -> NC", "status": status, "message": message})
-
-    try:
-        if exp_flag_error:
-            raise Exception(exp_flag_error)
-        row = next((r for r in exp_flag_rows if r["LKP_ROW_WID"] == "2"), None)
-        status = "PASS" if row and row["o_Flag"] == "U" else "FAIL"
-        message = f"Expected o_Flag=U, Actual={row['o_Flag'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_009 – EXP_Flag mismatch -> U", "status": status, "message": message})
-
-    try:
-        if exp_flag_error:
-            raise Exception(exp_flag_error)
-        row = next((r for r in exp_flag_rows if r["BUR"] == " " and r["LKP_NEW_BUR"] == ""), None)
-        status = "PASS" if row and row["o_Flag"] == "U" else "FAIL"
-        message = f"Expected o_Flag=U, Actual={row['o_Flag'] if row else None}"
-    except Exception as e:
-        status = "ERROR"
-        message = str(e)
-    unit_results.append({"suite": "Unit", "name": "UT_010 – EXP_Flag whitespace vs empty -> U", "status": status, "message": message})
-
-    # Functional Tests
-    try:
-        if active_flag_error:
-            raise Exception(active_flag_error)
-        row = next((r for r in active_flag_rows if r["ACTIVE_FLAG"] == "N"), None)
-        status = "PASS" if row and row["IS_ACTIVE"] == 0 else "FAIL"
-        message = f"Expected IS_ACTIVE=0, Actual={row['IS_ACTIVE'] if row else None}"
+        ft5_df = spark.createDataFrame([(None, "A", None, "W_CLAIM_CD_BUR_SCD3")], schema_ft5)
+        ft5_flagged = apply_exp_flag(ft5_df)
+        ft5_insert = ft5_flagged.filter(F.col("o_Flag") == "I")
+        ft5_with_rowwid = execute_mplt_CDM_ROW_WID(ft5_insert)
+        ft5_rows = ft5_with_rowwid.collect()
+        actual_flag = ft5_rows[0]["o_Flag"]
+        actual_row_wid = ft5_rows[0]["ROW_WID"]
+        assert actual_flag == "I" and actual_row_wid == 6
         func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_001",
-            "test_scenario": "ACTIVE_FLAG='N' sets IS_ACTIVE=0",
-            "input_data": "ACTIVE_FLAG='N'",
-            "expected_result": "IS_ACTIVE=0",
-            "actual_result": row["IS_ACTIVE"] if row else None,
-            "status": status,
-            "message": message
-        })
-    except Exception as e:
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_001",
-            "test_scenario": "ACTIVE_FLAG='N' sets IS_ACTIVE=0",
-            "input_data": "ACTIVE_FLAG='N'",
-            "expected_result": "IS_ACTIVE=0",
-            "actual_result": None,
-            "status": "ERROR",
-            "message": str(e)
-        })
-
-    try:
-        if active_flag_error:
-            raise Exception(active_flag_error)
-        row = next((r for r in active_flag_rows if r["ACTIVE_FLAG"] == "N"), None)
-        status = "PASS" if row and row["END_DATE"] is not None else "FAIL"
-        message = f"Expected END_DATE not null, Actual={row['END_DATE'] if row else None}"
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_002",
-            "test_scenario": "ACTIVE_FLAG='N' sets END_DATE=current_date",
-            "input_data": "ACTIVE_FLAG='N'",
-            "expected_result": "END_DATE not null",
-            "actual_result": row["END_DATE"] if row else None,
-            "status": status,
-            "message": message
-        })
-    except Exception as e:
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_002",
-            "test_scenario": "ACTIVE_FLAG='N' sets END_DATE=current_date",
-            "input_data": "ACTIVE_FLAG='N'",
-            "expected_result": "END_DATE not null",
-            "actual_result": None,
-            "status": "ERROR",
-            "message": str(e)
-        })
-
-    try:
-        if active_flag_error:
-            raise Exception(active_flag_error)
-        n_count = len([r for r in active_flag_rows if r["ACTIVE_FLAG"] == "N"])
-        status = "PASS" if n_count == 1 else "FAIL"
-        message = f"Expected count=1, Actual={n_count}"
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_003",
-            "test_scenario": "ACTIVE_FLAG='N' record not deleted",
-            "input_data": "ACTIVE_FLAG='N'",
-            "expected_result": "Record exists count=1",
-            "actual_result": n_count,
-            "status": status,
-            "message": message
-        })
-    except Exception as e:
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_003",
-            "test_scenario": "ACTIVE_FLAG='N' record not deleted",
-            "input_data": "ACTIVE_FLAG='N'",
-            "expected_result": "Record exists count=1",
-            "actual_result": None,
-            "status": "ERROR",
-            "message": str(e)
-        })
-
-    try:
-        if active_flag_error:
-            raise Exception(active_flag_error)
-        row = next((r for r in active_flag_rows if r["ACTIVE_FLAG"] == "Y"), None)
-        status = "PASS" if row and row["IS_ACTIVE"] == 1 and row["END_DATE"] is None else "FAIL"
-        message = f"Expected IS_ACTIVE=1 and END_DATE=None, Actual=({row['IS_ACTIVE'] if row else None},{row['END_DATE'] if row else None})"
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_004",
-            "test_scenario": "ACTIVE_FLAG='Y' reactivation sets IS_ACTIVE=1 and END_DATE=None",
-            "input_data": "ACTIVE_FLAG='Y'",
-            "expected_result": "IS_ACTIVE=1, END_DATE=None",
-            "actual_result": (row["IS_ACTIVE"], row["END_DATE"]) if row else None,
-            "status": status,
-            "message": message
-        })
-    except Exception as e:
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_004",
-            "test_scenario": "ACTIVE_FLAG='Y' reactivation sets IS_ACTIVE=1 and END_DATE=None",
-            "input_data": "ACTIVE_FLAG='Y'",
-            "expected_result": "IS_ACTIVE=1, END_DATE=None",
-            "actual_result": None,
-            "status": "ERROR",
-            "message": str(e)
-        })
-
-    try:
-        if ft5_error:
-            raise Exception(ft5_error)
-        row = ft5_rows[0] if ft5_rows else None
-        status = "PASS" if row and row["o_Flag"] == "I" and row["ROW_WID"] == 6 else "FAIL"
-        message = f"Expected o_Flag=I and ROW_WID=6, Actual=({row['o_Flag'] if row else None},{row['ROW_WID'] if row else None})"
-        func_results.append({
-            "suite": "Functional",
+            "suite": "FUNCTIONAL",
             "test_id": "FT_005",
-            "test_scenario": "New record -> INSERT group, ROW_WID incremented",
-            "input_data": "LKP_ROW_WID=NULL, BUR!=LKP_NEW_BUR",
-            "expected_result": "o_Flag=I, ROW_WID incremented",
-            "actual_result": (row["o_Flag"], row["ROW_WID"]) if row else None,
-            "status": status,
-            "message": message
+            "test_scenario": "New record → INSERT group, ROW_WID incremented",
+            "input_data": str([(None, "A", None, "W_CLAIM_CD_BUR_SCD3")]),
+            "expected_result": "o_Flag=I, ROW_WID=6",
+            "actual_result": f"o_Flag={actual_flag}, ROW_WID={actual_row_wid}",
+            "status": "PASS",
+            "message": ""
         })
-    except Exception as e:
+    except AssertionError as e:
         func_results.append({
-            "suite": "Functional",
+            "suite": "FUNCTIONAL",
             "test_id": "FT_005",
-            "test_scenario": "New record -> INSERT group, ROW_WID incremented",
-            "input_data": "LKP_ROW_WID=NULL, BUR!=LKP_NEW_BUR",
-            "expected_result": "o_Flag=I, ROW_WID incremented",
-            "actual_result": None,
+            "test_scenario": "New record → INSERT group, ROW_WID incremented",
+            "input_data": str([(None, "A", None, "W_CLAIM_CD_BUR_SCD3")]),
+            "expected_result": "o_Flag=I, ROW_WID=6",
+            "actual_result": f"o_Flag={actual_flag}, ROW_WID={actual_row_wid}",
+            "status": "FAIL",
+            "message": str(e)
+        })
+    except Exception as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_005",
+            "test_scenario": "New record → INSERT group, ROW_WID incremented",
+            "input_data": str([(None, "A", None, "W_CLAIM_CD_BUR_SCD3")]),
+            "expected_result": "o_Flag=I, ROW_WID=6",
+            "actual_result": "ERROR",
             "status": "ERROR",
             "message": str(e)
         })
 
+    # FT_006 and FT_007 reuse one action
+    schema_ft6 = StructType([
+        StructField("ID", IntegerType(), True),
+        StructField("LKP_ROW_WID", StringType(), True),
+        StructField("BUR", StringType(), True),
+        StructField("LKP_NEW_BUR", StringType(), True)
+    ])
+    ft6_rows_data = [
+        (1, "1", "A", "A"),
+        (2, "2", "A", "B")
+    ]
+    ft6_df = spark.createDataFrame(ft6_rows_data, schema_ft6)
+    ft6_flagged = apply_exp_flag(ft6_df).withColumn(
+        "Update_Strategy_Expression_78066",
+        F.when(F.col("o_Flag") == "U", F.lit("DD_UPDATE"))
+    )
+    ft6_rows = ft6_flagged.collect()
+    ft6_map = {r["ID"]: r.asDict() for r in ft6_rows}
+
     try:
-        if mixed_error:
-            raise Exception(mixed_error)
-        row = next((r for r in mixed_rows if r["o_Flag"] == "NC"), None)
-        status = "PASS" if row else "FAIL"
-        message = f"Expected NC row exists, Actual={'FOUND' if row else 'NOT FOUND'}"
+        assert ft6_map[1]["o_Flag"] == "NC"
         func_results.append({
-            "suite": "Functional",
+            "suite": "FUNCTIONAL",
             "test_id": "FT_006",
-            "test_scenario": "Existing record, BUR unchanged -> DEFAULT (NC)",
-            "input_data": "BUR=LKP_NEW_BUR, LKP_ROW_WID not null",
-            "expected_result": "o_Flag=NC",
-            "actual_result": row["o_Flag"] if row else None,
-            "status": status,
-            "message": message
+            "test_scenario": "Existing record, BUR unchanged → DEFAULT (NC group)",
+            "input_data": str(ft6_rows_data),
+            "expected_result": "o_Flag=NC for ID=1",
+            "actual_result": f"o_Flag={ft6_map[1]['o_Flag']}",
+            "status": "PASS",
+            "message": ""
         })
-    except Exception as e:
+    except AssertionError as e:
         func_results.append({
-            "suite": "Functional",
+            "suite": "FUNCTIONAL",
             "test_id": "FT_006",
-            "test_scenario": "Existing record, BUR unchanged -> DEFAULT (NC)",
-            "input_data": "BUR=LKP_NEW_BUR, LKP_ROW_WID not null",
-            "expected_result": "o_Flag=NC",
-            "actual_result": None,
+            "test_scenario": "Existing record, BUR unchanged → DEFAULT (NC group)",
+            "input_data": str(ft6_rows_data),
+            "expected_result": "o_Flag=NC for ID=1",
+            "actual_result": f"o_Flag={ft6_map[1]['o_Flag']}",
+            "status": "FAIL",
+            "message": str(e)
+        })
+    except Exception as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_006",
+            "test_scenario": "Existing record, BUR unchanged → DEFAULT (NC group)",
+            "input_data": str(ft6_rows_data),
+            "expected_result": "o_Flag=NC for ID=1",
+            "actual_result": "ERROR",
             "status": "ERROR",
             "message": str(e)
         })
 
     try:
-        if mixed_error:
-            raise Exception(mixed_error)
-        row = next((r for r in mixed_rows if r["o_Flag"] == "U"), None)
-        status = "PASS" if row and row["Update_Strategy_Expression_78066"] == "DD_UPDATE" else "FAIL"
-        message = f"Expected DD_UPDATE, Actual={row['Update_Strategy_Expression_78066'] if row else None}"
+        assert ft6_map[2]["o_Flag"] == "U" and ft6_map[2]["Update_Strategy_Expression_78066"] == "DD_UPDATE"
         func_results.append({
-            "suite": "Functional",
+            "suite": "FUNCTIONAL",
             "test_id": "FT_007",
-            "test_scenario": "Existing record, BUR changed -> UPDATE, strategy DD_UPDATE",
-            "input_data": "BUR!=LKP_NEW_BUR, LKP_ROW_WID not null",
-            "expected_result": "o_Flag=U, strategy=DD_UPDATE",
-            "actual_result": row["Update_Strategy_Expression_78066"] if row else None,
-            "status": status,
-            "message": message
+            "test_scenario": "Existing record, BUR changed → UPDATE, strategy == 'DD_UPDATE'",
+            "input_data": str(ft6_rows_data),
+            "expected_result": "o_Flag=U, Update_Strategy_Expression_78066=DD_UPDATE for ID=2",
+            "actual_result": f"o_Flag={ft6_map[2]['o_Flag']}, Update_Strategy_Expression_78066={ft6_map[2]['Update_Strategy_Expression_78066']}",
+            "status": "PASS",
+            "message": ""
         })
-    except Exception as e:
+    except AssertionError as e:
         func_results.append({
-            "suite": "Functional",
+            "suite": "FUNCTIONAL",
             "test_id": "FT_007",
-            "test_scenario": "Existing record, BUR changed -> UPDATE, strategy DD_UPDATE",
-            "input_data": "BUR!=LKP_NEW_BUR, LKP_ROW_WID not null",
-            "expected_result": "o_Flag=U, strategy=DD_UPDATE",
-            "actual_result": None,
-            "status": "ERROR",
+            "test_scenario": "Existing record, BUR changed → UPDATE, strategy == 'DD_UPDATE'",
+            "input_data": str(ft6_rows_data),
+            "expected_result": "o_Flag=U, Update_Strategy_Expression_78066=DD_UPDATE for ID=2",
+            "actual_result": f"o_Flag={ft6_map[2]['o_Flag']}, Update_Strategy_Expression_78066={ft6_map[2]['Update_Strategy_Expression_78066']}",
+            "status": "FAIL",
             "message": str(e)
-        })
-
-    try:
-        if mixed_error:
-            raise Exception(mixed_error)
-        count_i = len([r for r in mixed_rows if r["o_Flag"] == "I"])
-        count_u = len([r for r in mixed_rows if r["o_Flag"] == "U"])
-        count_nc = len([r for r in mixed_rows if r["o_Flag"] == "NC"])
-        status = "PASS" if (count_i, count_u, count_nc) == (1, 1, 1) else "FAIL"
-        message = f"Expected counts I/U/NC = 1/1/1, Actual={count_i}/{count_u}/{count_nc}"
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_008",
-            "test_scenario": "Mixed batch I+U+NC counts",
-            "input_data": "3-row mixed flags",
-            "expected_result": "I=1, U=1, NC=1",
-            "actual_result": f"{count_i}/{count_u}/{count_nc}",
-            "status": status,
-            "message": message
         })
     except Exception as e:
         func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_008",
-            "test_scenario": "Mixed batch I+U+NC counts",
-            "input_data": "3-row mixed flags",
-            "expected_result": "I=1, U=1, NC=1",
-            "actual_result": None,
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_007",
+            "test_scenario": "Existing record, BUR changed → UPDATE, strategy == 'DD_UPDATE'",
+            "input_data": str(ft6_rows_data),
+            "expected_result": "o_Flag=U, Update_Strategy_Expression_78066=DD_UPDATE for ID=2",
+            "actual_result": "ERROR",
             "status": "ERROR",
             "message": str(e)
         })
 
+    # FT_008 Mixed batch (I + U + NC)
     try:
-        if batch_id_error:
-            raise Exception(batch_id_error)
-        row = next((r for r in batch_id_rows if r["SOURCE_NAME"] == "SRC_MISS"), None)
-        status = "PASS" if row and row["o_BATCH_ID"] == -999 else "FAIL"
-        message = f"Expected o_BATCH_ID=-999, Actual={row['o_BATCH_ID'] if row else None}"
+        schema_ft8 = StructType([
+            StructField("ID", IntegerType(), True),
+            StructField("LKP_ROW_WID", StringType(), True),
+            StructField("BUR", StringType(), True),
+            StructField("LKP_NEW_BUR", StringType(), True)
+        ])
+        ft8_rows_data = [
+            (1, None, "A", "A"),
+            (2, "1", "A", "B"),
+            (3, "2", "C", "C")
+        ]
+        ft8_df = spark.createDataFrame(ft8_rows_data, schema_ft8)
+        ft8_flagged = apply_exp_flag(ft8_df).cache()
+        ft8_rows = ft8_flagged.collect()
+        insert_count = len([r for r in ft8_rows if r["o_Flag"] == "I"])
+        update_count = len([r for r in ft8_rows if r["o_Flag"] == "U"])
+        default_count = len([r for r in ft8_rows if r["o_Flag"] not in ["I", "U"]])
+        assert insert_count == 1 and update_count == 1 and default_count == 1
         func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_009",
-            "test_scenario": "Batch ID lookup miss",
-            "input_data": "SOURCE_NAME=SRC_MISS",
-            "expected_result": "o_BATCH_ID=-999",
-            "actual_result": row["o_BATCH_ID"] if row else None,
-            "status": status,
-            "message": message
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_008",
+            "test_scenario": "Mixed batch (I + U + NC): insert/update/default counts",
+            "input_data": str(ft8_rows_data),
+            "expected_result": "insert=1, update=1, default=1",
+            "actual_result": f"insert={insert_count}, update={update_count}, default={default_count}",
+            "status": "PASS",
+            "message": ""
+        })
+    except AssertionError as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_008",
+            "test_scenario": "Mixed batch (I + U + NC): insert/update/default counts",
+            "input_data": str(ft8_rows_data),
+            "expected_result": "insert=1, update=1, default=1",
+            "actual_result": f"insert={insert_count}, update={update_count}, default={default_count}",
+            "status": "FAIL",
+            "message": str(e)
         })
     except Exception as e:
         func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_009",
-            "test_scenario": "Batch ID lookup miss",
-            "input_data": "SOURCE_NAME=SRC_MISS",
-            "expected_result": "o_BATCH_ID=-999",
-            "actual_result": None,
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_008",
+            "test_scenario": "Mixed batch (I + U + NC): insert/update/default counts",
+            "input_data": str(ft8_rows_data),
+            "expected_result": "insert=1, update=1, default=1",
+            "actual_result": "ERROR",
             "status": "ERROR",
             "message": str(e)
         })
 
+    # FT_009 reuse UT_006 output
     try:
-        if exp_flag_error:
-            raise Exception(exp_flag_error)
-        row = next((r for r in exp_flag_rows if r["BUR"] == " " and r["LKP_NEW_BUR"] == ""), None)
-        status = "PASS" if row and row["o_Flag"] == "U" else "FAIL"
-        message = f"Expected o_Flag=U, Actual={row['o_Flag'] if row else None}"
+        actual_batch_id = ut6_rows[0]["o_BATCH_ID"]
+        assert actual_batch_id == -999
         func_results.append({
-            "suite": "Functional",
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_009",
+            "test_scenario": "Batch ID lookup miss → o_BATCH_ID == -999",
+            "input_data": "SOURCE_NAME='SRC_MISS'",
+            "expected_result": "o_BATCH_ID=-999",
+            "actual_result": f"o_BATCH_ID={actual_batch_id}",
+            "status": "PASS",
+            "message": ""
+        })
+    except AssertionError as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_009",
+            "test_scenario": "Batch ID lookup miss → o_BATCH_ID == -999",
+            "input_data": "SOURCE_NAME='SRC_MISS'",
+            "expected_result": "o_BATCH_ID=-999",
+            "actual_result": f"o_BATCH_ID={actual_batch_id}",
+            "status": "FAIL",
+            "message": str(e)
+        })
+    except Exception as e:
+        func_results.append({
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_009",
+            "test_scenario": "Batch ID lookup miss → o_BATCH_ID == -999",
+            "input_data": "SOURCE_NAME='SRC_MISS'",
+            "expected_result": "o_BATCH_ID=-999",
+            "actual_result": "ERROR",
+            "status": "ERROR",
+            "message": str(e)
+        })
+
+    # FT_010 reuse UT_010 output
+    try:
+        actual_flag = ut10_rows[0]["o_Flag"]
+        assert actual_flag == "U"
+        func_results.append({
+            "suite": "FUNCTIONAL",
             "test_id": "FT_010",
-            "test_scenario": "BUR whitespace vs empty -> U not NC",
+            "test_scenario": "BUR whitespace vs empty → flag == 'U' not 'NC'",
             "input_data": "BUR=' ', LKP_NEW_BUR=''",
             "expected_result": "o_Flag=U",
-            "actual_result": row["o_Flag"] if row else None,
-            "status": status,
-            "message": message
+            "actual_result": f"o_Flag={actual_flag}",
+            "status": "PASS",
+            "message": ""
         })
-    except Exception as e:
+    except AssertionError as e:
         func_results.append({
-            "suite": "Functional",
+            "suite": "FUNCTIONAL",
             "test_id": "FT_010",
-            "test_scenario": "BUR whitespace vs empty -> U not NC",
+            "test_scenario": "BUR whitespace vs empty → flag == 'U' not 'NC'",
             "input_data": "BUR=' ', LKP_NEW_BUR=''",
             "expected_result": "o_Flag=U",
-            "actual_result": None,
-            "status": "ERROR",
+            "actual_result": f"o_Flag={actual_flag}",
+            "status": "FAIL",
             "message": str(e)
-        })
-
-    try:
-        if filter_error:
-            raise Exception(filter_error)
-        all_valid = all(r["IS_ACTIVE"] == 1 and r["END_DATE"] is None for r in filter_rows)
-        status = "PASS" if all_valid else "FAIL"
-        message = f"Filtered rows valid: {all_valid}"
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_011",
-            "test_scenario": "Filter active records only",
-            "input_data": "IS_ACTIVE=1 and END_DATE is NULL filter",
-            "expected_result": "All rows IS_ACTIVE=1 and END_DATE is NULL",
-            "actual_result": str(filter_rows),
-            "status": status,
-            "message": message
         })
     except Exception as e:
         func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_011",
-            "test_scenario": "Filter active records only",
-            "input_data": "IS_ACTIVE=1 and END_DATE is NULL filter",
-            "expected_result": "All rows IS_ACTIVE=1 and END_DATE is NULL",
-            "actual_result": None,
-            "status": "ERROR",
-            "message": str(e)
-        })
-
-    try:
-        if filter_error:
-            raise Exception(filter_error)
-        status = "PASS" if len(filter_rows) == 1 else "FAIL"
-        message = f"Expected 1 active row, Actual={len(filter_rows)}"
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_012",
-            "test_scenario": "Filter excludes inactive or ended records",
-            "input_data": "IS_ACTIVE=0 or END_DATE not null",
-            "expected_result": "Excluded from result",
-            "actual_result": len(filter_rows),
-            "status": status,
-            "message": message
-        })
-    except Exception as e:
-        func_results.append({
-            "suite": "Functional",
-            "test_id": "FT_012",
-            "test_scenario": "Filter excludes inactive or ended records",
-            "input_data": "IS_ACTIVE=0 or END_DATE not null",
-            "expected_result": "Excluded from result",
-            "actual_result": None,
+            "suite": "FUNCTIONAL",
+            "test_id": "FT_010",
+            "test_scenario": "BUR whitespace vs empty → flag == 'U' not 'NC'",
+            "input_data": "BUR=' ', LKP_NEW_BUR=''",
+            "expected_result": "o_Flag=U",
+            "actual_result": "ERROR",
             "status": "ERROR",
             "message": str(e)
         })
@@ -1410,68 +1410,79 @@ finally:
     spark.table = original_spark_table
 
 def build_report(unit_results, func_results):
-    all_results = unit_results + func_results
-    total = len(all_results)
-    passed = sum(1 for r in all_results if r.get("status") == "PASS")
-    failed = sum(1 for r in all_results if r.get("status") == "FAIL")
-    errors = sum(1 for r in all_results if r.get("status") == "ERROR")
+    total = len(unit_results) + len(func_results)
+    passed = len([r for r in unit_results + func_results if r["status"] == "PASS"])
+    failed = len([r for r in unit_results + func_results if r["status"] == "FAIL"])
+    errors = len([r for r in unit_results + func_results if r["status"] == "ERROR"])
 
     def status_color(status):
         return {"PASS": "#c6efce", "FAIL": "#ffc7ce", "ERROR": "#ffeb9c"}.get(status, "#ffffff")
 
-    unit_rows = ""
+    unit_rows_html = ""
     for r in unit_results:
-        unit_rows += f"""
-        <tr>
+        unit_rows_html += f"""
+        <tr style="background-color:{status_color(r['status'])};">
             <td>{r['suite']}</td>
             <td>{r['name']}</td>
-            <td style="background-color:{status_color(r['status'])}">{r['status']}</td>
+            <td>{r['status']}</td>
             <td>{r['message']}</td>
         </tr>
         """
 
-    func_cards = ""
+    func_cards_html = ""
     for r in func_results:
-        func_cards += f"""
-        <div style="border:1px solid #ddd; padding:10px; margin:8px 0;">
+        func_cards_html += f"""
+        <div style="border:1px solid #ccc; padding:10px; margin:10px 0; background-color:{status_color(r['status'])};">
             <div><b>Suite:</b> {r['suite']}</div>
             <div><b>Test ID:</b> {r['test_id']}</div>
             <div><b>Scenario:</b> {r['test_scenario']}</div>
-            <div><b>Input:</b> {r['input_data']}</div>
-            <div><b>Expected:</b> {r['expected_result']}</div>
-            <div><b>Actual:</b> {r['actual_result']}</div>
-            <div><b>Status:</b> <span style="background-color:{status_color(r['status'])}; padding:2px 6px;">{r['status']}</span></div>
+            <div><b>Input Data:</b> {r['input_data']}</div>
+            <div><b>Expected Result:</b> {r['expected_result']}</div>
+            <div><b>Actual Result:</b> {r['actual_result']}</div>
+            <div><b>Status:</b> {r['status']}</div>
             <div><b>Message:</b> {r['message']}</div>
         </div>
         """
 
     html = f"""
-    <div style="font-family:Arial, sans-serif; font-size:14px;">
-        <div style="padding:10px; background:#f2f2f2; margin-bottom:10px;">
-            <b>Summary:</b> Total={total} | Passed={passed} | Failed={failed} | Errors={errors}
+    <html>
+    <head>
+        <style>
+            body {{ font-family: Arial, sans-serif; }}
+            .summary {{ padding:10px; background:#f2f2f2; margin-bottom:10px; }}
+            .tab-button {{ padding:10px; margin-right:5px; cursor:pointer; background:#ddd; border:none; }}
+            .tab-content {{ display:none; }}
+            .tab-content.active {{ display:block; }}
+            table {{ width:100%; border-collapse:collapse; }}
+            th, td {{ border:1px solid #ccc; padding:8px; text-align:left; }}
+        </style>
+        <script>
+            function showTab(tabId) {{
+                document.getElementById('unit_tab').classList.remove('active');
+                document.getElementById('func_tab').classList.remove('active');
+                document.getElementById(tabId).classList.add('active');
+            }}
+        </script>
+    </head>
+    <body>
+        <div class="summary">
+            <b>Total:</b> {total} | <b>Passed:</b> {passed} | <b>Failed:</b> {failed} | <b>Errors:</b> {errors}
         </div>
-        <div style="margin-bottom:10px;">
-            <button onclick="showTab('unit')" style="margin-right:5px;">Unit Tests</button>
-            <button onclick="showTab('functional')">Functional Tests</button>
-        </div>
-        <div id="tab_unit">
-            <table style="border-collapse:collapse; width:100%;" border="1">
-                <tr style="background:#eee;">
-                    <th>Suite</th><th>Test Name</th><th>Status</th><th>Message</th>
-                </tr>
-                {unit_rows}
+        <button class="tab-button" onclick="showTab('unit_tab')">Unit Tests</button>
+        <button class="tab-button" onclick="showTab('func_tab')">Functional Tests</button>
+
+        <div id="unit_tab" class="tab-content active">
+            <table>
+                <tr><th>Suite</th><th>Test Name</th><th>Status</th><th>Message</th></tr>
+                {unit_rows_html}
             </table>
         </div>
-        <div id="tab_functional" style="display:none;">
-            {func_cards}
+
+        <div id="func_tab" class="tab-content">
+            {func_cards_html}
         </div>
-    </div>
-    <script>
-        function showTab(tab) {{
-            document.getElementById('tab_unit').style.display = tab === 'unit' ? 'block' : 'none';
-            document.getElementById('tab_functional').style.display = tab === 'functional' ? 'block' : 'none';
-        }}
-    </script>
+    </body>
+    </html>
     """
     return html
 
