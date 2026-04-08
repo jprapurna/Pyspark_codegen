@@ -1,50 +1,44 @@
 version: 2
 
 sources:
-  - name: snowflake_cloud_data_warehouse_v2
-    description: Source data from Snowflake Cloud Data Warehouse V2.
-    database: Snowflake Cloud Data Warehouse V2
+  - name: snowflake_cloud_data_warehouse
+    description: Source data from Snowflake Cloud Data Warehouse.
+    database: Snowflake Cloud Data Warehouse
     schema: null
 
     tables:
-      - name: cdh_gw_bur
-        description: Error: 002003 (02000): 01c391ae-0312-62f9-0008-19fb01f8c806: SQL compilation error:
-Schema 'GENAI_POWER_BI.NONE' does not exist or not authorized.
+      - name: CDH_GW_BUR
+        description: Error: 002003 (02000): 01c391b4-0312-66c6-0008-19fb01f91496: SQL compilation error:
+          Schema 'GENAI_POWER_BI.NONE' does not exist or not authorized.
         identifier: CDH_GW_BUR
-
         columns: []
 
-      - name: w_claim_cd_bur_scd3_i
-        description: Error: 001003 (42000): 01c391ae-0312-6028-0008-19fb01f961fe: SQL compilation error:
-syntax error line 1 at position 31 unexpected '$W_CLAIM_CD_BUR_SCD3_I'.
+      - name: $W_CLAIM_CD_BUR_SCD3_I
+        description: Error: 001003 (42000): 01c391b4-0312-6028-0008-19fb01f96256: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$W_CLAIM_CD_BUR_SCD3_I'.
         identifier: $W_CLAIM_CD_BUR_SCD3_I
-
         columns: []
 
-      - name: w_claim_cd_bur_scd3_u
-        description: Error: 001003 (42000): 01c391ae-0312-6029-0008-19fb01f8baa2: SQL compilation error:
-syntax error line 1 at position 31 unexpected '$W_CLAIM_CD_BUR_SCD3_U'.
+      - name: $W_CLAIM_CD_BUR_SCD3_U
+        description: Error: 001003 (42000): 01c391b4-0312-6750-0008-19fb01f94312: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$W_CLAIM_CD_BUR_SCD3_U'.
         identifier: $W_CLAIM_CD_BUR_SCD3_U
-
         columns: []
 
-      - name: lkp_w_claim_cd_bur_scd3
-        description: Error: 001003 (42000): 01c391ae-0312-6750-0008-19fb01f942b2: SQL compilation error:
-syntax error line 1 at position 31 unexpected '$LKP_W_CLAIM_CD_BUR_SCD3'.
+      - name: $LKP_W_CLAIM_CD_BUR_SCD3
+        description: Error: 001003 (42000): 01c391b4-0312-6544-0008-19fb01f908fa: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$LKP_W_CLAIM_CD_BUR_SCD3'.
         identifier: $LKP_W_CLAIM_CD_BUR_SCD3
-
         columns: []
 
-      - name: mplt_cdm_batch_id_lkp_cdm_batch_ctrlid
-        description: Error: 001003 (42000): 01c391ae-0312-6544-0008-19fb01f90892: SQL compilation error:
-syntax error line 1 at position 31 unexpected '$mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID'.
+      - name: $mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID
+        description: Error: 001003 (42000): 01c391b4-0312-62f9-0008-19fb01f8c89e: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID'.
         identifier: $mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID
-
         columns: []
 
-      - name: mplt_cdm_row_wid_lkp_max_row_wid
-        description: Error: 001003 (42000): 01c391ae-0312-62f9-0008-19fb01f8c80a: SQL compilation error:
-syntax error line 1 at position 31 unexpected '$mplt_CDM_ROW_WID_lkp_MAX_ROW_WID'.
+      - name: $mplt_CDM_ROW_WID_lkp_MAX_ROW_WID
+        description: Error: 001003 (42000): 01c391b4-0312-6750-0008-19fb01f94316: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$mplt_CDM_ROW_WID_lkp_MAX_ROW_WID'.
         identifier: $mplt_CDM_ROW_WID_lkp_MAX_ROW_WID
-
         columns: []

@@ -14,9 +14,8 @@ with
     /* 2) Lookup transformation to retrieve maximum ROW_WID */
     lkp_max_row_wid as (
         select
-            nvl(max(row_wid), 0) as ROW_WID,
-            'TABLE_NAME' as TABLE_NAME
-        from {{ source('snowflake_cloud_data_warehouse_v2', 'custom_table') }}
+            nvl(max(row_wid), 0) as ROW_WID
+        from {{ var('schema_cdm') }}.{{ var('tgt_table_name') }}
         where table_name = (select IN_TABLE_NAME from input_data)
     ),
 
@@ -24,15 +23,12 @@ with
     exp_row_wid as (
         select
             case 
-                when v2 = 0 then (select row_wid from lkp_max_row_wid)
+                when v2 = 0 then (select ROW_WID from lkp_max_row_wid)
                 else v2
             end as V1,
             V1 + 1 as V2,
             V2 as ROW_WID
-        from (
-            select 
-                0 as v2 -- Initial value for v2
-            )
+        from input_data
     )
 
 select
