@@ -1,5 +1,5 @@
 {% macro mplt_cdm_batch_id(source_name) %}
--- Derives the maximum batch ID for the given source name, handling null values.
+-- Derive maximum batch ID for a given source name, handling null values.
 -- source: mapplet mplt_CDM_BATCH_ID
 -- do not print or log anything here
 
@@ -15,12 +15,12 @@ with
         select
             SOURCE_NAME,
             max(BATCH_ID) as LKP_BATCH_ID
-        from {{ source('Snowflake_Cloud_Data_Warehouse', '$LKP_W_CLAIM_CD_BUR_SCD3') }}
+        from {{ source('snowflake_cloud_data_warehouse', 'CDM.lkp_CDM_BATCH_CTRLID') }}
         where SOURCE_NAME = (select SOURCE_NAME from input_data)
         group by SOURCE_NAME
     ),
 
-    /* 3) Check for null values in batch ID and derive output */
+    /* 3) Check for null values in batch ID and derive final output */
     exp_null_check as (
         select
             iif(isnull(LKP_BATCH_ID), -999, LKP_BATCH_ID) as o_BATCH_ID,
@@ -29,6 +29,7 @@ with
     )
 
 select
-    o_BATCH_ID
+    o_BATCH_ID,
+    SOURCE_NAME
 from exp_null_check
 {% endmacro %}

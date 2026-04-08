@@ -14,9 +14,10 @@ with
     /* 2) Lookup transformation to retrieve maximum ROW_WID */
     lkp_max_row_wid as (
         select
-            nvl(max(ROW_WID), 0) as ROW_WID
-        from {{ source('Snowflake_Cloud_Data_Warehouse', '$mplt_CDM_ROW_WID_lkp_MAX_ROW_WID') }}
-        where TABLE_NAME = (select IN_TABLE_NAME from input_data)
+            nvl(max(row_wid), 0) as ROW_WID,
+            table_name as TABLE_NAME
+        from {{ var('schema_cdm') }}.{{ var('tgt_table_name') }}
+        where table_name = (select IN_TABLE_NAME from input_data)
     ),
 
     /* 3) Expression transformation to calculate ROW_WID */
@@ -28,7 +29,10 @@ with
             end as V1,
             V1 + 1 as V2,
             V2 as ROW_WID
-        from input_data
+        from (
+            select 
+                0 as v2 -- Initialize v2 for conditional logic
+            )
     )
 
 select
