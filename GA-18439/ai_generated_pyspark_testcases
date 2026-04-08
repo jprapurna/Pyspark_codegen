@@ -45,20 +45,17 @@ try:
             CDH_GWODS.CDH_GW_BUR
     """
     
-    # Attempt to read data from Unity Catalog or execute custom SQL query
+    # Attempt to read data from Unity Catalog
     try:
-        logger.info(f"Attempting to read from Unity Catalog table: {source_table}")
+        logger.info(f"Attempting to read from Unity Catalog: {source_table}")
         final_df_6 = spark.sql(custom_sql_query)
-        logger.info(f"✓ Successfully executed custom SQL query for table: {source_table}")
-    except Exception as e:
-        logger.error(f"✗ Error executing custom SQL query for table {source_table}: {str(e)}")
-        raise Exception(f"Critical error in Node 6: Unable to execute SQL query for source table {source_table}. Error: {str(e)}")
-    
-    # Filter records where IS_ACTIVE = 0 and set END_DATE = current_date()
-    final_df_6 = final_df_6.filter(F.col("IS_ACTIVE") == 0).withColumn("END_DATE", F.current_date())
+        logger.info(f"✓ Successfully read data using custom SQL query")
+    except Exception as catalog_error:
+        logger.error(f"✗ Error reading from Unity Catalog: {str(catalog_error)}")
+        raise Exception(f"Critical error in Node 6: Unable to read data from Unity Catalog. Error: {str(catalog_error)}")
     
     # Safe logging of DataFrame information
-    logger.info(f"=== SQ_CDH_GW_BUR - Node 6 ===")
+    logger.info(f"=== Source: SQ_CDH_GW_BUR - Node 6 ===")
     logger.info(f"   └─ Columns: {len(final_df_6.columns)}")
     final_df_6.printSchema()
     final_df_6.show(3, truncate=False)
@@ -86,17 +83,13 @@ try:
     final_df_11 = spark.table(source_table)
     logger.info(f"✓ Successfully read data from Unity Catalog table: {source_table}")
     
-    # Apply filter to process inactive claim codes only (IS_ACTIVE = 0)
-    final_df_11 = final_df_11.filter(F.col("IS_ACTIVE") == 0)
-    
-    # Update END_DATE to current_date() for filtered records
-    final_df_11 = final_df_11.withColumn("END_DATE", F.current_date())
+    # Filter records where IS_ACTIVE = 0 and set END_DATE to current_date()
+    final_df_11 = final_df_11.withColumn("END_DATE", F.current_date()) \
+                             .filter(F.col("IS_ACTIVE") == 0)
     
     # Safe logging of DataFrame information
     logger.info(f"=== Source: LKP_W_CLAIM_CD_BUR_SCD3 - Node 11 ===")
-    logger.info(f"   └─ Columns: {len(final_df_11.columns)}")
-    final_df_11.printSchema()
-    final_df_11.show(3, truncate=False)
+    log_df_info(final_df_11, "Filtered DataFrame")
     
     logger.info("✓ Node 11 completed successfully")
     
@@ -205,7 +198,7 @@ try:
     logger.info("Processing Node 38: lkp_MAX_ROW_WID (Source)")
     
     # Define source table and connection details
-    source_table = "catalog.schema.CUSTOM_TABLE"  # Replace with actual catalog and schema
+    source_table = "catalog.schema.CUSTOM_TABLE"  # Replace with actual Unity Catalog table path
     local_file_path = "/mnt/data/CUSTOM_TABLE.csv"  # Fallback local file path (if applicable)
     
     # Read data from Unity Catalog or fallback to local file
@@ -241,46 +234,37 @@ try:
     # ============================================================================
     # STEP 1: Filter records where IS_ACTIVE = 0 and set END_DATE = current_date()
     # ============================================================================
-    # Assuming the previous nodes (23 and 33) have already processed the data and 
-    # their outputs are available as final_df_23 and final_df_33 respectively.
-    # We will union the outputs from both nodes and apply the required transformations.
+    # Assuming the previous node outputs are combined into a single DataFrame
+    # final_df_23 and final_df_33 are the outputs from previous nodes
+    # Union the outputs from previous nodes (23 and 33) to create a single DataFrame
+    final_df_combined = final_df_23.unionByName(final_df_33, allowMissingColumns=True)
     
-    # Union the outputs from previous nodes
-    logger.info("Unioning outputs from previous nodes: 23 and 33")
-    final_df_union = final_df_23.unionByName(final_df_33, allowMissingColumns=True)
+    # Apply the filter and transformation
+    final_df_25 = final_df_combined.filter(F.col("IS_ACTIVE") == 0).withColumn("END_DATE", F.current_date())
     
-    # Filter records where IS_ACTIVE = 0
-    logger.info("Filtering records where IS_ACTIVE = 0")
-    filtered_df = final_df_union.filter(F.col("IS_ACTIVE") == 0)
-    
-    # Set END_DATE to current_date()
-    logger.info("Setting END_DATE to current_date()")
-    transformed_df = filtered_df.withColumn("END_DATE", F.current_date())
-    
-    # Log DataFrame information
-    log_df_info(transformed_df, "Transformed DataFrame (Filtered and Updated)")
+    # Safe logging of the filtered DataFrame
+    log_df_info(final_df_25, "Filtered and Transformed Data for Node 25")
     
     # ============================================================================
     # STEP 2: Write the transformed data to the target table in Unity Catalog
     # ============================================================================
     # Define target location
-    target_catalog = "catalog_name"
-    target_schema = "schema_name"
+    target_catalog = "snowflake_catalog"
+    target_schema = "public"
     target_table = "W_CLAIM_CD_BUR_SCD3_I"
     
     # Ensure the schema exists
-    logger.info(f"Ensuring schema {target_catalog}.{target_schema} exists")
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {target_catalog}.{target_schema}")
+    logger.info(f"Schema {target_catalog}.{target_schema} ensured")
     
     # Write the data to the target table
-    logger.info(f"Writing data to target table: {target_catalog}.{target_schema}.{target_table}")
-    transformed_df.write \
+    final_df_25.write \
         .format("delta") \
         .mode("overwrite") \
         .option("overwriteSchema", "true") \
         .saveAsTable(f"{target_catalog}.{target_schema}.{target_table}")
     
-    logger.info(f"✓ Data written successfully to {target_catalog}.{target_schema}.{target_table}")
+    logger.info(f"✓ Data written to {target_catalog}.{target_schema}.{target_table}")
     logger.info("✓ Node 25 completed successfully")
     
 except Exception as e:
@@ -298,50 +282,44 @@ try:
     logger.info("Processing Node 20: W_CLAIM_CD_BUR_SCD3_U (Output)")
     
     # ============================================================================
-    # STEP 1: Retrieve DataFrame from Previous Node
+    # STEP 1: Read data from the previous node
     # ============================================================================
-    # The output of the previous node (Node 18) is expected to be available as final_df_18
-    # Ensure the DataFrame exists and is valid
-    if 'final_df_18' not in locals():
-        raise Exception("Previous node DataFrame (final_df_18) is not available. Ensure Node 18 has been processed successfully.")
-    
-    # Log the input DataFrame information
-    log_df_info(final_df_18, "Input DataFrame from Node 18")
+    # Assuming the previous node's output DataFrame is named final_df_18
+    logger.info("Reading data from previous node (Node 18)")
+    input_df = final_df_18
     
     # ============================================================================
-    # STEP 2: Apply Transformation Logic
+    # STEP 2: Apply transformation logic
     # ============================================================================
     # Filter records where IS_ACTIVE = 0 and set END_DATE = current_date()
-    final_df_20 = final_df_18.filter(F.col("IS_ACTIVE") == 0).withColumn("END_DATE", F.current_date())
+    logger.info("Applying transformation: Filter inactive records and update END_DATE")
+    transformed_df = input_df.filter(F.col("IS_ACTIVE") == 0).withColumn("END_DATE", F.current_date())
     
-    # Log the transformed DataFrame information
-    log_df_info(final_df_20, "Transformed DataFrame for Node 20")
+    # Log the transformed DataFrame
+    log_df_info(transformed_df, "Transformed DataFrame (Node 20)")
     
     # ============================================================================
-    # STEP 3: Write Data to Target Table in Unity Catalog
+    # STEP 3: Write data to the target table in Unity Catalog
     # ============================================================================
-    # Define target catalog, schema, and table
-    target_catalog = "snowflake_catalog"
-    target_schema = "claim_data"
+    # Define target table details
+    target_catalog = "catalog_name"
+    target_schema = "schema_name"
     target_table = "W_CLAIM_CD_BUR_SCD3_U"
     
     # Ensure the schema exists
+    logger.info(f"Ensuring schema exists: {target_catalog}.{target_schema}")
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {target_catalog}.{target_schema}")
-    logger.info(f"Schema {target_catalog}.{target_schema} ensured")
     
-    # Write the DataFrame to the target table in Unity Catalog
-    final_df_20.write \
+    # Write the transformed data to the target table
+    logger.info(f"Writing data to target table: {target_catalog}.{target_schema}.{target_table}")
+    transformed_df.write \
         .format("delta") \
         .mode("overwrite") \
         .option("overwriteSchema", "true") \
         .saveAsTable(f"{target_catalog}.{target_schema}.{target_table}")
     
-    logger.info(f"✓ Data written to {target_catalog}.{target_schema}.{target_table}")
-    
-    # ============================================================================
-    # STEP 4: Final Logging and Completion
-    # ============================================================================
-    logger.info(f"✓ Node 20 completed successfully")
+    logger.info(f"✓ Data successfully written to {target_catalog}.{target_schema}.{target_table}")
+    logger.info("✓ Node 20 completed successfully")
     
 except Exception as e:
     logger.error(f"✗ Error in Node 20 (W_CLAIM_CD_BUR_SCD3_U): {str(e)}")
@@ -355,42 +333,42 @@ except Exception as e:
 # ============================================================================
 
 try:
-    logger.info("Processing Node 10: Output")
-
+    logger.info("Processing Node 10: Output (Output)")
+    
     # ============================================================================
     # STEP 1: Filter records where IS_ACTIVE = 0 and set END_DATE = current_date()
     # ============================================================================
     # Fetch the DataFrame from the previous node (Node 7)
     input_df = final_df_7
-
+    
     # Apply transformation: Filter inactive records and update END_DATE
     final_df_10 = input_df.filter(F.col("IS_ACTIVE") == 0).withColumn("END_DATE", F.current_date())
-
+    
     # Safe logging of the transformed DataFrame
     log_df_info(final_df_10, "Filtered and Transformed Data for Node 10")
-
+    
     # ============================================================================
     # STEP 2: Write the transformed data to Unity Catalog
     # ============================================================================
     # Define target location in Unity Catalog
     target_catalog = "catalog_name"
     target_schema = "schema_name"
-    target_table = "W_CLAIM_CD_BUR_SCD3_I"
-
+    target_table = "W_CLAIM_CD_BUR_SCD3_I"  # Insert operations table
+    
     # Ensure the schema exists
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {target_catalog}.{target_schema}")
     logger.info(f"Schema {target_catalog}.{target_schema} ensured")
-
-    # Write the DataFrame to Unity Catalog as a Delta table
+    
+    # Write the DataFrame to Unity Catalog (Delta format)
     final_df_10.write \
         .format("delta") \
         .mode("overwrite") \
         .option("overwriteSchema", "true") \
         .saveAsTable(f"{target_catalog}.{target_schema}.{target_table}")
-
+    
     logger.info(f"✓ Data written to {target_catalog}.{target_schema}.{target_table}")
     logger.info("✓ Node 10 completed successfully")
-
+    
 except Exception as e:
     logger.error(f"✗ Error in Node 10 (Output): {str(e)}")
     raise Exception(f"Critical error in Node 10: {str(e)}")
