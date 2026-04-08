@@ -30,7 +30,7 @@ with
             V2 as ROW_WID
         from (
             select 
-                0 as v2 -- Initial value for v2
+                0 as v2 -- Initialize v2 for conditional logic
             )
     )
 

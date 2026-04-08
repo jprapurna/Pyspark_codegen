@@ -4,20 +4,21 @@ WITH SQ_CDH_GW_BUR AS (
         POLICY_STATE AS POLICY_STATE, -- string
         BUR AS BUR,                   -- string
         'GWCDH' AS SOURCE_NAME        -- string
-    FROM {{ source('snowflake_cloud_data_warehouse_v2', 'cdh_gw_bur') }}
+    FROM {{ source('snowflake_cloud_data_warehouse_v2', 'CDH_GW_BUR') }}
 )
 
 
 -- Lookup node: LKP_W_CLAIM_CD_BUR_SCD3
 , LKP_W_CLAIM_CD_BUR_SCD3 AS (
     SELECT 
+        LKP_ROW_WID,
         LKP_INTEGRATION_ID,
         LKP_NEW_BUR,
         SOURCE_NAME,
         o_BATCH_ID,
         INTEGRATION_ID,
         BUR
-    FROM {{ source('snowflake_cloud_data_warehouse_v2', 'lkp_w_claim_cd_bur_scd3') }}
+    FROM {{ source('snowflake_cloud_data_warehouse_v2', 'W_CLAIM_CD_BUR_SCD3') }}
     WHERE INTEGRATION_ID = LKP_INTEGRATION_ID
 )
 
@@ -31,28 +32,26 @@ WITH SQ_CDH_GW_BUR AS (
         -- Passthrough fields
         BUR,
         SOURCE_NAME,
-        
-        -- Fields derived or passed from previous node
         LKP_ROW_WID,
         LKP_INTEGRATION_ID,
         o_BATCH_ID,
         LKP_NEW_BUR,
         ROW_ID
-    FROM PREVIOUS_NODE_NAME
+    FROM 6 -- Reference the previous node by its exact name
 )
 
 
 -- Lookup transformation node: LKP_W_CLAIM_CD_BUR_SCD3
-, lkp_w_claim_cd_bur_scd3 AS (
+, LKP_W_CLAIM_CD_BUR_SCD3 AS (
     SELECT 
         lkp.LKP_ROW_WID,
         lkp.LKP_INTEGRATION_ID,
         lkp.LKP_NEW_BUR,
         src.INTEGRATION_ID,
         src.BUR
-    FROM {{ source('snowflake_cloud_data_warehouse_v2', 'w_claim_cd_bur_scd3_i') }} AS src
-    LEFT JOIN {{ source('snowflake_cloud_data_warehouse_v2', 'lkp_w_claim_cd_bur_scd3') }} AS lkp
-        ON lkp.LKP_INTEGRATION_ID = src.INTEGRATION_ID
+    FROM {{ source('snowflake_cloud_data_warehouse_v2', 'W_CLAIM_CD_BUR_SCD3_I') }} AS src
+    LEFT JOIN {{ source('snowflake_cloud_data_warehouse_v2', 'LKP_W_CLAIM_CD_BUR_SCD3') }} AS lkp
+    ON lkp.LKP_INTEGRATION_ID = src.INTEGRATION_ID
 )
 
 
@@ -61,7 +60,7 @@ WITH SQ_CDH_GW_BUR AS (
     SELECT 
         -- Derived fields with transformation expressions
         CASE 
-            WHEN ISNULL(LKP_ROW_WID) THEN 'I'
+            WHEN LKP_ROW_WID IS NULL THEN 'I'
             WHEN MD5(BUR) = MD5(LKP_NEW_BUR) THEN 'NC'
             ELSE 'U'
         END AS o_Flag,
@@ -122,7 +121,7 @@ WITH SQ_CDH_GW_BUR AS (
 final AS (
     SELECT
         ROW_WID
-    FROM W_CLAIM_CD_BUR_SCD3_I
+    FROM 18
 )
 
 SELECT * FROM final
@@ -140,7 +139,7 @@ SELECT * FROM final
 final AS (
     SELECT
         *
-    FROM W_CLAIM_CD_BUR_SCD3_I
+    FROM 23, 33
 )
 
 SELECT * FROM final
