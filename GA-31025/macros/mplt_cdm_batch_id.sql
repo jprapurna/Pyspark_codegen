@@ -1,5 +1,5 @@
 {% macro mplt_cdm_batch_id(source_name) %}
--- Derive maximum batch ID for a given source name, handling null values.
+-- Derive maximum batch ID for the given source name, handling null values.
 -- source: mapplet mplt_CDM_BATCH_ID
 -- do not print or log anything here
 
@@ -15,7 +15,7 @@ with
         select
             SOURCE_NAME,
             max(BATCH_ID) as LKP_BATCH_ID
-        from {{ source('snowflake_cloud_data_warehouse', 'CDM.lkp_CDM_BATCH_CTRLID') }}
+        from {{ source('snowflake_cloud_data_warehouse_v2', 'CDM.lkp_CDM_BATCH_CTRLID') }}
         where SOURCE_NAME = (select SOURCE_NAME from input_data)
         group by SOURCE_NAME
     ),

@@ -1,1 +1,44 @@
-Error generating source.yml: division by zero
+version: 2
+
+sources:
+  - name: snowflake_cloud_data_warehouse_v2
+    description: Source data from Snowflake Cloud Data Warehouse V2.
+    database: Snowflake Cloud Data Warehouse V2
+    schema: null
+
+    tables:
+      - name: CDH_GW_BUR
+        description: Error: 002003 (02000): 01c391a8-0312-6547-0008-19fb01f95376: SQL compilation error:
+          Schema 'GENAI_POWER_BI.NONE' does not exist or not authorized.
+        identifier: CDH_GW_BUR
+        columns: []
+
+      - name: $W_CLAIM_CD_BUR_SCD3_I
+        description: Error: 001003 (42000): 01c391a8-0312-66c6-0008-19fb01f913fe: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$W_CLAIM_CD_BUR_SCD3_I'.
+        identifier: $W_CLAIM_CD_BUR_SCD3_I
+        columns: []
+
+      - name: $W_CLAIM_CD_BUR_SCD3_U
+        description: Error: 001003 (42000): 01c391a8-0312-6544-0008-19fb01f90842: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$W_CLAIM_CD_BUR_SCD3_U'.
+        identifier: $W_CLAIM_CD_BUR_SCD3_U
+        columns: []
+
+      - name: $LKP_W_CLAIM_CD_BUR_SCD3
+        description: Error: 001003 (42000): 01c391a8-0312-6750-0008-19fb01f94286: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$LKP_W_CLAIM_CD_BUR_SCD3'.
+        identifier: $LKP_W_CLAIM_CD_BUR_SCD3
+        columns: []
+
+      - name: $mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID
+        description: Error: 001003 (42000): 01c391a8-0312-6029-0008-19fb01f8ba7a: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID'.
+        identifier: $mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID
+        columns: []
+
+      - name: $mplt_CDM_ROW_WID_lkp_MAX_ROW_WID
+        description: Error: 001003 (42000): 01c391a8-0312-677c-0008-19fb01f9810a: SQL compilation error:
+          syntax error line 1 at position 31 unexpected '$mplt_CDM_ROW_WID_lkp_MAX_ROW_WID'.
+        identifier: $mplt_CDM_ROW_WID_lkp_MAX_ROW_WID
+        columns: []
