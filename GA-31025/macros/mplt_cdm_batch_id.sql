@@ -10,25 +10,26 @@ with
             {{ source_name }} as SOURCE_NAME
     ),
 
-    /* 2) Lookup transformation to retrieve maximum batch ID */
+    /* 2) Lookup maximum batch ID from CDM_BATCH_CTRLID table */
     lkp_cdm_batch_ctrlid as (
         select
             SOURCE_NAME,
             max(BATCH_ID) as LKP_BATCH_ID
-        from {{ source('snowflake_cloud_data_warehouse_v2', 'lkp_cdm_batch_ctrlid') }}
+        from {{ source('CDM', 'lkp_CDM_BATCH_CTRLID') }}
         where SOURCE_NAME = (select SOURCE_NAME from input_data)
         group by SOURCE_NAME
     ),
 
-    /* 3) Expression transformation to handle null values */
+    /* 3) Check for null values in batch ID and apply default value */
     exp_null_check as (
         select
-            SOURCE_NAME,
-            iif(isnull(LKP_BATCH_ID), -999, LKP_BATCH_ID) as o_BATCH_ID
+            iif(isnull(LKP_BATCH_ID), -999, LKP_BATCH_ID) as o_BATCH_ID,
+            SOURCE_NAME
         from lkp_cdm_batch_ctrlid
     )
 
 select
-    o_BATCH_ID
+    o_BATCH_ID,
+    SOURCE_NAME
 from exp_null_check
 {% endmacro %}
