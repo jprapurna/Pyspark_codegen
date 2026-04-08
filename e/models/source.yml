@@ -1,0 +1,44 @@
+version: 2
+
+sources:
+  - name: snowflake_cloud_data_warehouse
+    description: Source data from Snowflake Cloud Data Warehouse
+    database: Snowflake Cloud Data Warehouse
+    schema: Unknown
+
+    tables:
+      - name: CDH_GW_BUR
+        description: Error: 002003 (02000): 01c3916b-0312-6028-0008-19fb01f87f5a: SQL compilation error:
+          Schema 'GENAI_POWER_BI.UNKNOWN' does not exist or not authorized.
+        identifier: CDH_GW_BUR
+        columns: []
+
+      - name: $W_CLAIM_CD_BUR_SCD3_I
+        description: Error: 001003 (42000): 01c3916b-0312-66db-0008-19fb01f93186: SQL compilation error:
+          syntax error line 1 at position 34 unexpected '$W_CLAIM_CD_BUR_SCD3_I'.
+        identifier: $W_CLAIM_CD_BUR_SCD3_I
+        columns: []
+
+      - name: $W_CLAIM_CD_BUR_SCD3_U
+        description: Error: 001003 (42000): 01c3916b-0312-62f9-0008-19fb01f8c4da: SQL compilation error:
+          syntax error line 1 at position 34 unexpected '$W_CLAIM_CD_BUR_SCD3_U'.
+        identifier: $W_CLAIM_CD_BUR_SCD3_U
+        columns: []
+
+      - name: $LKP_W_CLAIM_CD_BUR_SCD3
+        description: Error: 001003 (42000): 01c3916b-0312-66c6-0008-19fb01f9115e: SQL compilation error:
+          syntax error line 1 at position 34 unexpected '$LKP_W_CLAIM_CD_BUR_SCD3'.
+        identifier: $LKP_W_CLAIM_CD_BUR_SCD3
+        columns: []
+
+      - name: $mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID
+        description: Error: 001003 (42000): 01c3916b-0312-6547-0008-19fb01f950ae: SQL compilation error:
+          syntax error line 1 at position 34 unexpected '$mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID'.
+        identifier: $mplt_CDM_BATCH_ID_lkp_CDM_BATCH_CTRLID
+        columns: []
+
+      - name: $mplt_CDM_ROW_WID_lkp_MAX_ROW_WID
+        description: Error: 001003 (42000): 01c3916b-0312-6029-0008-19fb01f8b7fe: SQL compilation error:
+          syntax error line 1 at position 34 unexpected '$mplt_CDM_ROW_WID_lkp_MAX_ROW_WID'.
+        identifier: $mplt_CDM_ROW_WID_lkp_MAX_ROW_WID
+        columns: []
