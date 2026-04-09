@@ -1,5 +1,5 @@
 {% macro mplt_cdm_row_wid(tgt_table_name, in_table_name) %}
--- Derives ROW_WID using lookup and conditional logic
+-- Derives ROW_WID based on lookup and conditional logic
 -- source: mapplet mplt_CDM_ROW_WID
 -- do not print or log anything here
 
@@ -14,8 +14,7 @@ with
     /* 2) Lookup transformation to retrieve maximum ROW_WID */
     lkp_max_row_wid as (
         select
-            coalesce(max(row_wid), 0) as ROW_WID,
-            table_name as TABLE_NAME
+            coalesce(max(row_wid), 0) as ROW_WID
         from {{ source('$$SCHEMA_CDM', '$$TGT_TABLE_NAME') }}
         where table_name = (select IN_TABLE_NAME from input_data)
     ),
@@ -31,8 +30,10 @@ with
             V2 as ROW_WID
         from (
             select 
-                0 as v2 -- Initialize v2 for conditional logic
-            ) as base
+                0 as v2, -- Initial value for v2
+                (select ROW_WID from lkp_max_row_wid) as ROW_WID
+            from input_data
+        )
     )
 
 select
