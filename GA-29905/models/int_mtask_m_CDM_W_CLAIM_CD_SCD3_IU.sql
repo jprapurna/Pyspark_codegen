@@ -2,8 +2,8 @@
 WITH SQ_CDH_GW_BUR AS (
     SELECT 
         CDH_GW_BUR.POLICY_STATE AS POLICY_STATE, -- string
-        CDH_GW_BUR.BUR AS BUR, -- string
-        'GWCDH' AS SOURCE_NAME -- string
+        CDH_GW_BUR.BUR AS BUR,                   -- string
+        'GWCDH' AS SOURCE_NAME                   -- string
     FROM 
         {{ source('SCHEMA_CDH_GWODS', 'CDH_GW_BUR') }}
 )
@@ -15,19 +15,20 @@ WITH SQ_CDH_GW_BUR AS (
         t.LKP_ROW_WID,
         t.LKP_INTEGRATION_ID,
         t.LKP_NEW_BUR,
-        t.SOURCE_NAME,
-        t.o_BATCH_ID,
-        t.INTEGRATION_ID,
-        t.BUR
+        s.SOURCE_NAME,
+        s.o_BATCH_ID,
+        s.INTEGRATION_ID,
+        s.BUR
     FROM {{ source('CDM', 'W_CLAIM_CD_BUR_SCD3') }} t
-    WHERE t.INTEGRATION_ID = <PREVIOUS_NODE_NAME>.INTEGRATION_ID
+    LEFT JOIN previous_node_cte s
+        ON t.INTEGRATION_ID = s.INTEGRATION_ID
 )
 
 
 -- Transformation node: EXP_BUR
 , EXP_BUR AS (
     SELECT 
-        -- Derived field mapping
+        -- Derived field: POLICY_STATE mapped to INTEGRATION_ID
         POLICY_STATE AS INTEGRATION_ID,
         
         -- Passthrough fields
@@ -47,14 +48,14 @@ WITH SQ_CDH_GW_BUR AS (
     SELECT 
         previous_node.INTEGRATION_ID,
         previous_node.BUR,
-        lkp_table.ROW_WID AS LKP_ROW_WID,
-        lkp_table.INTEGRATION_ID AS LKP_INTEGRATION_ID,
-        lkp_table.NEW_BUR AS LKP_NEW_BUR,
+        lkp_table.LKP_ROW_WID,
+        lkp_table.LKP_INTEGRATION_ID,
+        lkp_table.LKP_NEW_BUR,
         lkp_table.SOURCE_NAME,
         lkp_table.o_BATCH_ID
-    FROM previous_node
+    FROM previous_node AS previous_node
     LEFT JOIN {{ source('CDM', 'W_CLAIM_CD_BUR_SCD3') }} AS lkp_table
-    ON lkp_table.INTEGRATION_ID = previous_node.INTEGRATION_ID
+        ON lkp_table.LKP_INTEGRATION_ID = previous_node.INTEGRATION_ID
 )
 
 
@@ -63,7 +64,7 @@ WITH SQ_CDH_GW_BUR AS (
     SELECT 
         -- Derived fields with transformation expressions
         CASE 
-            WHEN LKP_ROW_WID IS NULL THEN 'I'
+            WHEN ISNULL(LKP_ROW_WID) THEN 'I'
             WHEN MD5(BUR) = MD5(LKP_NEW_BUR) THEN 'NC'
             ELSE 'U'
         END AS o_Flag,
@@ -99,7 +100,7 @@ WITH SQ_CDH_GW_BUR AS (
         LKP_INTEGRATION_ID,
         in_INTEGRATION_ID,
         BATCH_ID
-    FROM rtr_CLM_INSERT_UPD
+    FROM rtr_CLM_INSERT_UPD_cte
     WHERE o_Flag = 'I' OR o_Flag = 'U'
 )
 
@@ -124,7 +125,7 @@ WITH SQ_CDH_GW_BUR AS (
 final AS (
     SELECT
         *
-    FROM 18
+    FROM W_CLAIM_CD_BUR_SCD3_U
 )
 
 SELECT * FROM final
@@ -133,7 +134,7 @@ SELECT * FROM final
 {{ config(
     materialized='incremental',
     alias='W_CLAIM_CD_BUR_SCD3',   -- Target table name
-    unique_key='o_Flag',           -- Unique key for incremental strategy
+    unique_key='o_Flag',           -- Unique key field
     incremental_strategy='merge',
     on_schema_change='append_new_columns',
     merge_update_columns=['o_Flag'] -- Include all target fields
