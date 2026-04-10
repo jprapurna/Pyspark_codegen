@@ -14,7 +14,8 @@ with
     /* 2) Lookup transformation to retrieve maximum ROW_WID */
     lkp_max_row_wid as (
         select
-            coalesce(max(row_wid), 0) as ROW_WID
+            coalesce(max(row_wid), 0) as ROW_WID,
+            table_name as TABLE_NAME
         from {{ source('$$SCHEMA_CDM', '$$TGT_TABLE_NAME') }}
         where table_name = (select IN_TABLE_NAME from input_data)
     ),
@@ -30,10 +31,8 @@ with
             V2 as ROW_WID
         from (
             select 
-                0 as v2, -- Initial value for v2
-                (select ROW_WID from lkp_max_row_wid) as ROW_WID
-            from input_data
-        )
+                0 as v2 -- Initial value for v2
+            ) as base
     )
 
 select

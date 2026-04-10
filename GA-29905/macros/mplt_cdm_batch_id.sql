@@ -10,7 +10,7 @@ with
             {{ source_name }} as SOURCE_NAME
     ),
 
-    /* 2) Lookup transformation to retrieve maximum batch ID */
+    /* 2) Perform lookup on CDM_BATCH_CTRLID table */
     lkp_cdm_batch_ctrlid as (
         select
             SOURCE_NAME,
@@ -20,14 +20,11 @@ with
         group by SOURCE_NAME
     ),
 
-    /* 3) Expression transformation to handle null values */
+    /* 3) Check for null values in batch ID */
     exp_null_check as (
         select
             SOURCE_NAME,
-            case 
-                when LKP_BATCH_ID is null then -999
-                else LKP_BATCH_ID
-            end as o_BATCH_ID
+            iif(isnull(LKP_BATCH_ID), -999, LKP_BATCH_ID) as o_BATCH_ID
         from lkp_cdm_batch_ctrlid
     )
 
