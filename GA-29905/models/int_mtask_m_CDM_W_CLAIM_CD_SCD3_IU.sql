@@ -2,13 +2,13 @@
 WITH SQ_CDH_GW_BUR AS (
     SELECT 
         POLICY_STATE AS POLICY_STATE, -- string
-        BUR AS BUR, -- string
-        'GWCDH' AS SOURCE_NAME -- string
+        BUR AS BUR,                   -- string
+        'GWCDH' AS SOURCE_NAME        -- string
     FROM {{ source('SCHEMA_CDH_GWODS', 'CDH_GW_BUR') }}
 )
 
 
--- Lookup transformation node: LKP_W_CLAIM_CD_BUR_SCD3
+-- Transformation node: LKP_W_CLAIM_CD_BUR_SCD3
 , LKP_W_CLAIM_CD_BUR_SCD3 AS (
     SELECT 
         LKP_INTEGRATION_ID,
@@ -81,23 +81,14 @@ WITH SQ_CDH_GW_BUR AS (
 -- Transformation node: rtr_CLM_INSERT_UPD
 , rtr_CLM_INSERT_UPD AS (
     SELECT 
-        *,
-        CASE 
-            WHEN o_Flag = 'I' THEN CURRENT_TIMESTAMP
-            ELSE NULL
-        END AS CDM_INSERT_DT,
-        CASE 
-            WHEN o_Flag = 'U' THEN CURRENT_TIMESTAMP
-            ELSE NULL
-        END AS CDM_UPDATE_DT,
-        CASE 
-            WHEN o_Flag = 'I' OR o_Flag = 'U' THEN TGT_TABLE_NAME
-            ELSE NULL
-        END AS TGT_TABLE_NAME,
+        o_Flag,
+        CASE WHEN o_Flag = 'I' THEN CURRENT_TIMESTAMP ELSE NULL END AS CDM_INSERT_DT,
+        CASE WHEN o_Flag = 'U' THEN CURRENT_TIMESTAMP ELSE NULL END AS CDM_UPDATE_DT,
+        CASE WHEN o_Flag = 'I' OR o_Flag = 'U' THEN TGT_TABLE_NAME ELSE NULL END AS TGT_TABLE_NAME,
         LKP_INTEGRATION_ID,
         in_INTEGRATION_ID,
         BATCH_ID
-    FROM rtr_CLM_INSERT_UPD_cte
+    FROM 14 -- Reference to the previous node
     WHERE o_Flag = 'I' OR o_Flag = 'U'
 )
 
@@ -112,17 +103,17 @@ WITH SQ_CDH_GW_BUR AS (
 
 {{ config(
     materialized='incremental',
-    alias='W_CLAIM_CD_BUR_SCD3',
-    unique_key='ROW_WID',
+    alias='W_CLAIM_CD_BUR_SCD3',   -- Target table name
+    unique_key='ROW_WID',          -- Unique key for incremental updates
     incremental_strategy='merge',
     on_schema_change='append_new_columns',
-    merge_update_columns=['ROW_WID']
+    merge_update_columns=['ROW_WID'] -- Include all target fields
 ) }}
 
 final AS (
     SELECT
         *
-    FROM 18
+    FROM W_CLAIM_CD_BUR_SCD3_U
 )
 
 SELECT * FROM final
@@ -131,7 +122,7 @@ SELECT * FROM final
 {{ config(
     materialized='incremental',
     alias='W_CLAIM_CD_BUR_SCD3',   -- Target table name
-    unique_key='o_Flag',           -- Unique key field
+    unique_key='o_Flag',           -- Unique key for incremental merge
     incremental_strategy='merge',
     on_schema_change='append_new_columns',
     merge_update_columns=['o_Flag'] -- Include all target fields
@@ -140,7 +131,7 @@ SELECT * FROM final
 final AS (
     SELECT
         *
-    FROM 23, 33 -- Previous nodes
+    FROM 23, 33 -- Reference all previous nodes
 )
 
 SELECT * FROM final

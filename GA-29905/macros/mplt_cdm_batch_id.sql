@@ -10,7 +10,7 @@ with
             {{ source_name }} as SOURCE_NAME
     ),
 
-    /* 2) Perform lookup on CDM_BATCH_CTRLID table */
+    /* 2) Lookup maximum batch ID from CDM_BATCH_CTRLID table */
     lkp_cdm_batch_ctrlid as (
         select
             SOURCE_NAME,
@@ -20,7 +20,7 @@ with
         group by SOURCE_NAME
     ),
 
-    /* 3) Check for null values in batch ID */
+    /* 3) Check for null values in batch ID and apply default value */
     exp_null_check as (
         select
             SOURCE_NAME,
