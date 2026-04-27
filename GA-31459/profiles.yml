@@ -1,0 +1,13 @@
+snowflake:
+  outputs:
+    dev:
+      type: snowflake
+      account: ZBRMEWR-UEB09447
+      user: RGAJAVALLI_DATAECONOMY_IO
+      password: Admingmr@123
+      role: ACCOUNTADMIN
+      database: GENAI_POWER_BI
+      warehouse: GENAI_WH
+      schema: PUBLIC
+      threads: 4
+  target: dev
