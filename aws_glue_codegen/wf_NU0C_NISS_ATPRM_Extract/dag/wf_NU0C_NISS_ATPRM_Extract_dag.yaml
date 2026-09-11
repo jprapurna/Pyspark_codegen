@@ -1,0 +1,294 @@
+wf_NU0C_NISS_ATPRM_Extract_dag:
+  default_args:
+    owner: data-engineering
+    retries: 1
+    retry_delay_sec: 300
+  description: Migrated Informatica workflow wf_NU0C_NISS_ATPRM_Extract
+  schedule_interval: null
+  catchup: false
+  default_view: graph
+  tasks:
+    m_nu0c_niss_auto_100_atprm_lnd_load_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_100_atprm_lnd_load_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_100_ATPRM_LND_Load
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_100_ATPRM_LND_Load.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+    m_nu0c_ta_niss_auto_atprm_lnd_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_ta_niss_auto_atprm_lnd_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_TA_NISS_AUTO_ATPRM_LND
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_TA_NISS_AUTO_ATPRM_LND.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_100_atprm_lnd_load_task
+    m_nu0c_niss_auto_102_atprm_dtl_load_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_102_atprm_dtl_load_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_102_ATPRM_DTL_Load
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_102_ATPRM_DTL_Load.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_ta_niss_auto_atprm_lnd_task
+    m_nu0c_niss_auto_103_atprm_dtl_upd_classcd_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_103_atprm_dtl_upd_classcd_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_103_ATPRM_DTL_Upd_ClassCd
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_103_ATPRM_DTL_Upd_ClassCd.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_102_atprm_dtl_load_task
+    m_nu0c_ta_niss_auto_atprm_dtl_upd_classcd_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_ta_niss_auto_atprm_dtl_upd_classcd_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_TA_NISS_AUTO_ATPRM_DTL_Upd_ClassCd
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_TA_NISS_AUTO_ATPRM_DTL_Upd_ClassCd.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_103_atprm_dtl_upd_classcd_task
+    m_nu0c_niss_auto_104_atprm_dtl_upd_nynjclasscd_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_104_atprm_dtl_upd_nynjclasscd_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_104_ATPRM_DTL_Upd_NYNJClassCd
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_104_ATPRM_DTL_Upd_NYNJClassCd.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_ta_niss_auto_atprm_dtl_upd_classcd_task
+    m_nu0c_niss_auto_atprm_dtl_postsql_upd_dummy_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_atprm_dtl_postsql_upd_dummy_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_ATPRM_DTL_PostSQL_Upd_Dummy
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_ATPRM_DTL_PostSQL_Upd_Dummy.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_104_atprm_dtl_upd_nynjclasscd_task
+    m_nu0c_niss_auto_105_atprm_dtl_upd_cvgcd_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_105_atprm_dtl_upd_cvgcd_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_105_ATPRM_DTL_Upd_CvgCd
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_105_ATPRM_DTL_Upd_CvgCd.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_atprm_dtl_postsql_upd_dummy_task
+    m_nu0c_niss_auto_106_atprm_dtl_upd_nynjcvgcd_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_106_atprm_dtl_upd_nynjcvgcd_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_106_ATPRM_DTL_Upd_NYNJCvgCd
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_106_ATPRM_DTL_Upd_NYNJCvgCd.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_105_atprm_dtl_upd_cvgcd_task
+    m_nu0c_niss_auto_107_atprm_dtl_upd_plcylmt_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_107_atprm_dtl_upd_plcylmt_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_107_ATPRM_DTL_Upd_PlcyLmt
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_107_ATPRM_DTL_Upd_PlcyLmt.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_106_atprm_dtl_upd_nynjcvgcd_task
+    m_nu0c_niss_auto_108_atprm_dtl_upd_nynjplcylmt_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_108_atprm_dtl_upd_nynjplcylmt_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_108_ATPRM_DTL_Upd_NYNJPlcyLmt
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_108_ATPRM_DTL_Upd_NYNJPlcyLmt.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_107_atprm_dtl_upd_plcylmt_task
+    m_niss_plcy_limit_va_test_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_niss_plcy_limit_va_test_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NISS_PLCY_LIMIT_VA_TEST
+      script_location: s3://my-glue-bucket/glue-scripts/m_NISS_PLCY_LIMIT_VA_TEST.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_108_atprm_dtl_upd_nynjplcylmt_task
+    m_nu0c_niss_auto_109_atprm_dtl_upd_sublinecd_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_109_atprm_dtl_upd_sublinecd_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_109_ATPRM_DTL_Upd_SublineCd
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_109_ATPRM_DTL_Upd_SublineCd.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_niss_plcy_limit_va_test_task
+    m_nu0c_niss_auto_110_atprm_dtl_upd_nynjsublinecd_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_110_atprm_dtl_upd_nynjsublinecd_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_110_ATPRM_DTL_Upd_NYNJSublineCd
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_110_ATPRM_DTL_Upd_NYNJSublineCd.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_109_atprm_dtl_upd_sublinecd_task
+    m_nu0c_niss_auto_111_atprm_dtl_upd_cvg_attr_sk_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_111_atprm_dtl_upd_cvg_attr_sk_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_111_ATPRM_DTL_Upd_CVG_ATTR_SK
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_111_ATPRM_DTL_Upd_CVG_ATTR_SK.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_110_atprm_dtl_upd_nynjsublinecd_task
+    m_nu0c_niss_auto_111a_atprm_dtl_upd_cvgattrchksum_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_111a_atprm_dtl_upd_cvgattrchksum_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_111A_ATPRM_DTL_Upd_CvgAttrChkSum
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_111A_ATPRM_DTL_Upd_CvgAttrChkSum.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_111_atprm_dtl_upd_cvg_attr_sk_task
+    m_nu0c_niss_auto_111b_atprm_dtl_upd_cvgattrsk_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_111b_atprm_dtl_upd_cvgattrsk_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_111B_ATPRM_DTL_Upd_CvgAttrSk
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_111B_ATPRM_DTL_Upd_CvgAttrSk.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_111a_atprm_dtl_upd_cvgattrchksum_task
+    m_nu0c_niss_auto_112_atprm_dtl_upd_cvg_cd_sk_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_112_atprm_dtl_upd_cvg_cd_sk_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_112_ATPRM_DTL_Upd_CVG_CD_SK
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_112_ATPRM_DTL_Upd_CVG_CD_SK.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_111b_atprm_dtl_upd_cvgattrsk_task
+    m_nu0c_niss_auto_113_atprm_dtl_upd_exps_val_rolled_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_113_atprm_dtl_upd_exps_val_rolled_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_113_ATPRM_DTL_Upd_EXPS_VAL_ROLLED
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_113_ATPRM_DTL_Upd_EXPS_VAL_ROLLED.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_112_atprm_dtl_upd_cvg_cd_sk_task
+    m_nu0c_niss_auto_113_atprm_dtl_upd_exps_val_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_113_atprm_dtl_upd_exps_val_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_113_ATPRM_DTL_Upd_EXPS_VAL
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_113_ATPRM_DTL_Upd_EXPS_VAL.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_113_atprm_dtl_upd_exps_val_rolled_task
+    m_nu0c_niss_auto_114_atprm_dtl_upd_excpnsanddrops_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_114_atprm_dtl_upd_excpnsanddrops_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_114_ATPRM_DTL_Upd_ExcpnsAndDrops
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_114_ATPRM_DTL_Upd_ExcpnsAndDrops.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_113_atprm_dtl_upd_exps_val_task
+    m_nu0c_niss_auto_115_atprm_final_load_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_115_atprm_final_load_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_115_ATPRM_FINAL_Load
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_115_ATPRM_FINAL_Load.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_114_atprm_dtl_upd_excpnsanddrops_task
+    m_nu0c_niss_auto_117_atprm_sumry_load_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_117_atprm_sumry_load_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_117_ATPRM_SUMRY_Load
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_117_ATPRM_SUMRY_Load.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_115_atprm_final_load_task
+    m_nu0c_niss_auto_119_atprm_createreports_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_119_atprm_createreports_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_119_ATPRM_CreateReports
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_119_ATPRM_CreateReports.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_117_atprm_sumry_load_task
+    m_nu0c_niss_auto_119_atprm_dtl_split_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_119_atprm_dtl_split_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_119_ATPRM_DTL_SPLIT
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_119_ATPRM_DTL_SPLIT.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_119_atprm_createreports_task
+    m_nu0c_niss_auto_121_atprm_balancereports_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_nu0c_niss_auto_121_atprm_balancereports_task
+      job_name: wf_NU0C_NISS_ATPRM_Extract_m_NU0C_NISS_AUTO_121_ATPRM_BalanceReports
+      script_location: s3://my-glue-bucket/glue-scripts/m_NU0C_NISS_AUTO_121_ATPRM_BalanceReports.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_nu0c_niss_auto_119_atprm_dtl_split_task
