@@ -1,0 +1,30 @@
+wf_4201_calculate_interaction_facts 6_dag:
+  default_args:
+    owner: data-engineering
+    retries: 1
+    retry_delay_sec: 300
+  description: Migrated Informatica workflow wf_4201_calculate_interaction_facts 6
+  schedule_interval: null
+  catchup: false
+  default_view: graph
+  tasks:
+    m_4201_fnd_interactiongroupstatus_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_4201_fnd_interactiongroupstatus_task
+      job_name: wf_4201_calculate_interaction_facts 6_m_4201_fnd_interactiongroupstatus
+      script_location: s3://my-glue-bucket/glue-scripts/m_4201_fnd_interactiongroupstatus.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+    m_4201_dt_chn_interactiongroupstatus_task:
+      operator: airflow.providers.amazon.aws.operators.glue.GlueJobOperator
+      task_id: m_4201_dt_chn_interactiongroupstatus_task
+      job_name: wf_4201_calculate_interaction_facts 6_m_4201_dt_chn_interactiongroupstatus
+      script_location: s3://my-glue-bucket/glue-scripts/m_4201_dt_chn_interactiongroupstatus.py
+      region_name: us-east-1
+      iam_role_name: arn:aws:iam::ACCOUNT_ID:role/GlueJobRole
+      create_job_kwargs:
+        GlueVersion: '4.0'
+      dependencies:
+      - m_4201_fnd_interactiongroupstatus_task
